@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Local transactional OCR evidence spool; separate from the event database.
 
 PNG files are flushed and renamed before a metadata-only job is committed.

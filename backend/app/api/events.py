@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Literal
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response

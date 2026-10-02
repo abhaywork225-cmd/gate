@@ -1,3 +1,4 @@
+from __future__ import annotations
 from fastapi import APIRouter, Query, Request
 
 router = APIRouter(prefix='/api/detections', tags=['detections'])

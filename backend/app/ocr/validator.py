@@ -1,3 +1,4 @@
+from __future__ import annotations
 """ISO 6346 syntax/check digit, without guessing OCR character substitutions.
 
 Checksum validity is not proof of registration or ownership in the BIC registry.

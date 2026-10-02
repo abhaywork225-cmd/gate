@@ -1,4 +1,6 @@
+from __future__ import annotations
 from datetime import datetime
+from typing import Optional
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from app.domain import utcnow
@@ -31,17 +33,17 @@ class GateEvent(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     gate_id: Mapped[str] = mapped_column(String(64))
     timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
-    lane_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    container_number: Mapped[str | None] = mapped_column(String(11))
+    lane_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    container_number: Mapped[Optional[str]] = mapped_column(String(11))
     event_type: Mapped[str] = mapped_column(String(10))
     status: Mapped[str] = mapped_column(String(20))
     is_twin: Mapped[bool] = mapped_column(Boolean, default=False)
-    container_number_2: Mapped[str | None] = mapped_column(String(11), nullable=True)
-    iso_code_1: Mapped[str | None] = mapped_column(String(4), nullable=True)
-    iso_code_2: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    container_number_2: Mapped[Optional[str]] = mapped_column(String(11), nullable=True)
+    iso_code_1: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
+    iso_code_2: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
     cloud_synced: Mapped[bool] = mapped_column(Boolean, default=False)
-    cloud_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    cloud_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cloud_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    cloud_event_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     __table_args__ = (Index('ix_gate_identity_time', 'gate_id', 'container_number', 'event_type', 'timestamp'),)
 
@@ -84,7 +86,7 @@ class Snapshot(Base):
 class SystemLog(Base):
     __tablename__ = 'system_logs'
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    event_id: Mapped[str | None] = mapped_column(ForeignKey('gate_events.id'))
+    event_id: Mapped[Optional[str]] = mapped_column(ForeignKey('gate_events.id'))
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     level: Mapped[str] = mapped_column(String(10))
     event_name: Mapped[str] = mapped_column(String(100))

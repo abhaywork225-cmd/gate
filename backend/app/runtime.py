@@ -1,3 +1,4 @@
+from __future__ import annotations
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field

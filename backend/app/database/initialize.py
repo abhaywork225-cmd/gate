@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Non-destructive schema v1 initialization: python -m app.database.initialize."""
 from app.config.settings import Settings
 from app.database.database import Database

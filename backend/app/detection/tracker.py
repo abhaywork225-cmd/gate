@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Class-aware temporal IoU association, replaceable independently of YOLO.
 
 Deliberately small POC tracker; long occlusions require a calibrated stronger tracker.

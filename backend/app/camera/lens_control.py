@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Motorized lens controller for Dahua IP cameras with motorized varifocal lenses.
 
 Supports optical zoom (Tele/Wide), focus adjustment (Far/Near), and one-click AutoFocus.

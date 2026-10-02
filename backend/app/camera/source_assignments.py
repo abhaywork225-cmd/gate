@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Durable camera-source selections. RTSP URLs remain in environment variables."""
 import json
 import os

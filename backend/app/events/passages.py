@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Lane-aware truck passages. A camera is an observer, never a lane identity.
 
 Requires measured truck/trailer boxes. Text-only observations cannot establish

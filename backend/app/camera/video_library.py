@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Validated uploaded videos and durable per-slot assignments, independent of SQL.
 
 Original clips are retained when switching sources; no event evidence is deleted.

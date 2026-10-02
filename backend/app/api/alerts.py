@@ -1,3 +1,4 @@
+from __future__ import annotations
 import time
 import threading
 from uuid import uuid4

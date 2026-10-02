@@ -1,3 +1,4 @@
+from __future__ import annotations
 from app.camera.camera_worker import CameraWorker
 from app.camera.rtsp_stream import OpenCVStream
 from app.config.settings import resolve_source

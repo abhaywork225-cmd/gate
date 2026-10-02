@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Protocol, Any
 from multiprocessing import get_context
 import os
@@ -54,7 +55,8 @@ def _paddle_worker(requests, responses, use_gpu: bool, detection_model: str, rec
         for package_dir in site.getsitepackages():
             dll_dir = os.path.join(package_dir, 'nvidia', 'cu13', 'bin', 'x86_64')
             if os.path.isdir(dll_dir):
-                os.add_dll_directory(dll_dir)
+                if hasattr(os, 'add_dll_directory'):
+                    os.add_dll_directory(dll_dir)
                 os.environ['PATH'] = dll_dir + os.pathsep + os.environ.get('PATH', '')
         import paddle
         # PaddleX imports ModelScope only to discover optional remote model

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Bounded ONVIF discovery on directly attached IPv4 networks; no port sweep."""
 import base64
 import hashlib

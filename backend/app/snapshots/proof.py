@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Derived inspection image; never change the original captured evidence."""
 import re
 

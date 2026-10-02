@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sqlalchemy import create_engine, event, inspect, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool

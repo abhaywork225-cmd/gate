@@ -1,3 +1,4 @@
+from __future__ import annotations
 """View-space occupancy independent of short-lived tracker IDs.
 
 Only measured inference frames advance clearance. Missing camera frames never

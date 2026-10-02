@@ -1,3 +1,4 @@
+from __future__ import annotations
 def update_direction(camera, track, image_shape):
     """No camera-name guessing. Crossing geometry is calibrated per viewpoint."""
     if camera.line_axis is None:

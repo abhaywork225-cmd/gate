@@ -1,3 +1,4 @@
+from __future__ import annotations
 """OpenCV boundary. Native libraries are imported only when capture is requested."""
 import os
 from pathlib import Path
@@ -16,10 +17,28 @@ class OpenCVStream:
         if source_type == 'rtsp':
             if not source.lower().startswith(('rtsp://', 'rtsps://')):
                 raise ValueError('Configured camera source is not RTSP')
-            self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, [
-                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, settings.open_timeout_ms,
-                cv2.CAP_PROP_READ_TIMEOUT_MSEC, settings.read_timeout_ms,
-            ])
+            cap = None
+            use_nvdec = os.getenv('JETSON_NVDEC', 'auto').lower() in ('1', 'true', 'auto')
+            is_tegra = os.path.isfile('/etc/nv_tegra_release')
+            if use_nvdec and is_tegra and hasattr(cv2, 'CAP_GSTREAMER'):
+                try:
+                    gst = (
+                        f'rtspsrc location="{source}" protocols=tcp latency=100 ! '
+                        'rtph264depay ! h264parse ! nvv4l2decoder ! '
+                        'nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink drop=1'
+                    )
+                    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+                    if not cap.isOpened():
+                        cap.release()
+                        cap = None
+                except Exception:
+                    cap = None
+            if cap is None:
+                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, settings.open_timeout_ms,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, settings.read_timeout_ms,
+                ])
+            self.cap = cap
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         else:
             if not Path(source).is_file():
