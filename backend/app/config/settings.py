@@ -136,8 +136,8 @@ class Settings(BaseSettings):
     camera_onvif_username: str = ''
     camera_onvif_password: SecretStr = SecretStr('')
     cors_origins: list[str] = ['http://localhost:4200', 'http://127.0.0.1:4200']
-    open_timeout_ms: int = Field(default=5000, ge=100, le=30000)
-    read_timeout_ms: int = Field(default=3000, ge=100, le=30000)
+    open_timeout_ms: int = Field(default=15000, ge=100, le=60000)
+    read_timeout_ms: int = Field(default=8000, ge=100, le=60000)
     reconnect_initial_seconds: float = Field(default=1, gt=0)
     reconnect_max_seconds: float = Field(default=30, gt=0)
     max_frame_width: int = Field(default=1920, ge=320, le=4096)
