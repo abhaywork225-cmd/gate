@@ -34,7 +34,7 @@ import { EventDetail } from './gate-api.service';
           <div class="hero-main">
             <div class="hero-label">
               @if (item.is_twin) {
-                <span class="twin-header-pill">TWIN 20FT CONTAINER CHASSIS (2x 20FT)</span>
+                <span class="twin-header-pill">{{ item.status === 'CONFIRMED' && item.container_number_2 ? 'TWO CONTAINER IDENTITIES' : 'POSSIBLE TWIN · REVIEW REQUIRED' }}</span>
               } @else {
                 CONTAINER IDENTIFICATION & EVIDENCE
               }
@@ -46,7 +46,7 @@ import { EventDetail } from './gate-api.service';
                 <div class="twin-box-card">
                   <div class="twin-box-header">
                     <span class="slot-tag front">FRONT CONTAINER (SLOT 1)</span>
-                    <span class="size-pill feet">📏 {{ item.container_size || '20 FT' }} {{ item.size_code ? '(' + item.size_code + ')' : '' }}</span>
+                    <span class="size-pill feet">📏 {{ item.container_size || 'Size unconfirmed' }} {{ item.size_code ? '(' + item.size_code + ')' : '' }}</span>
                   </div>
                   <div class="hero-container-title">
                     <span class="container-badge mono">{{ item.container_number || 'UNCONFIRMED' }}</span>
@@ -57,7 +57,7 @@ import { EventDetail } from './gate-api.service';
                 <div class="twin-box-card">
                   <div class="twin-box-header">
                     <span class="slot-tag rear">REAR CONTAINER (SLOT 2)</span>
-                    <span class="size-pill feet">📏 {{ item.container_size_2 || '20 FT' }} {{ item.size_code_2 ? '(' + item.size_code_2 + ')' : '' }}</span>
+                    <span class="size-pill feet">📏 {{ item.container_size_2 || 'Size unconfirmed' }} {{ item.size_code_2 ? '(' + item.size_code_2 + ')' : '' }}</span>
                   </div>
                   <div class="hero-container-title">
                     <span class="container-badge mono">{{ item.container_number_2 || 'UNCONFIRMED' }}</span>
@@ -66,7 +66,7 @@ import { EventDetail } from './gate-api.service';
               </div>
 
               <div class="hero-meta-row twin-meta-row">
-                <span class="status-pill confirmed">{{ item.status.replaceAll('_', ' ') }}</span>
+                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="item.status !== 'CONFIRMED'">{{ item.status.replaceAll('_', ' ') }}</span>
                 <span class="movement-pill">{{ item.event_type }}</span>
                 <span class="meta-item"><strong>Lane:</strong> {{ item.gate_id }}</span>
                 <span class="meta-dot">·</span>
@@ -250,25 +250,6 @@ import { EventDetail } from './gate-api.service';
                 <h4 class="multi-angle-title">All captured camera images ({{ item.snapshots.length }})</h4>
                 <span class="image-refresh-note">Matched proof includes the number crop and raw OCR. Full resolution opens the unmodified capture.</span>
               </div>
-              @if (item.ocr_crops?.length) {
-                <div class="ocr-crops-section">
-                  <h4 class="multi-angle-title">OCR crops used for recognition ({{ item.ocr_crops!.length }})</h4>
-                  <div class="snapshots-grid ocr-crops-grid">
-                    @for (crop of item.ocr_crops; track crop.id) {
-                      <figure class="snapshot-card ocr-crop-card">
-                        <div class="snapshot-img-wrap">
-                          <img [src]="ocrCropUrl(crop.id)" [alt]="'OCR crop from ' + (crop.camera_id || 'camera')" (error)="markImageError('ocr-' + crop.id)" />
-                          <span class="camera-tag">{{ crop.camera_id || 'camera' }} · {{ crop.slot_position }}</span>
-                        </div>
-                        <figcaption>
-                          <span class="snap-time mono">{{ crop.normalized_text || 'OCR pending' }}</span>
-                          <a [href]="ocrCropUrl(crop.id)" target="_blank" class="view-raw-link">Open crop ↗</a>
-                        </figcaption>
-                      </figure>
-                    }
-                  </div>
-                </div>
-              }
               <div class="snapshots-grid">
                 @for (s of item.snapshots; track s.id) {
                   <figure class="snapshot-card" [class.is-primary]="s.id === item.primary_snapshot_id || s.id === item.rear_snapshot_id">
@@ -326,9 +307,6 @@ export class EventDetailComponent {
     return `/api/snapshots/${encodeURIComponent(id)}`;
   }
 
-  ocrCropUrl(id: string): string {
-    return `/api/ocr-crops/${encodeURIComponent(id)}?v=${encodeURIComponent(id)}`;
-  }
 
   markImageLoaded(id: string) {
     this.imageLoaded.update(state => ({ ...state, [id]: true }));

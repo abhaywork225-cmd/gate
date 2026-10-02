@@ -18,7 +18,7 @@ import { GateEvent } from './gate-api.service';
     <td class="mono font-bold">
       @if (event.is_twin) {
         <div class="twin-container-cell">
-          <span class="twin-badge-pill">TWIN 2x20'</span>
+          <span class="twin-badge-pill">{{ event.status === 'CONFIRMED' && event.container_number_2 ? 'TWO CONTAINERS' : 'POSSIBLE TWIN' }}</span>
           <div class="twin-numbers">
             <div class="twin-row"><span class="slot-tag front">F</span> {{ event.container_number || 'Unread' }}</div>
             <div class="twin-row"><span class="slot-tag rear">R</span> {{ event.container_number_2 || 'Unread' }}</div>
@@ -31,8 +31,8 @@ import { GateEvent } from './gate-api.service';
     <td>
       @if (event.is_twin) {
         <div class="twin-sizes">
-          <span class="size-pill feet">📏 {{ event.container_size || '20 FT' }} {{ event.size_code ? '(' + event.size_code + ')' : '' }}</span>
-          <span class="size-pill feet">📏 {{ event.container_size_2 || '20 FT' }} {{ event.size_code_2 ? '(' + event.size_code_2 + ')' : '' }}</span>
+          <span class="size-pill feet">📏 {{ event.container_size || 'Size unconfirmed' }} {{ event.size_code ? '(' + event.size_code + ')' : '' }}</span>
+          <span class="size-pill feet">📏 {{ event.container_size_2 || 'Size unconfirmed' }} {{ event.size_code_2 ? '(' + event.size_code_2 + ')' : '' }}</span>
         </div>
       } @else if (event.container_size) {
         <span class="size-pill" [class.feet]="event.container_size.includes('FT')">

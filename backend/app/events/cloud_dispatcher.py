@@ -361,7 +361,8 @@ class CloudOutboxDispatcher:
             self._worker_thread.join(timeout=timeout)
         log.info('prosper_cloud_dispatcher_stopped')
 
-    def enqueue(self, obs: Any, event_id: str, image_bytes: Optional[bytes] = None, payload: Optional[dict] = None):
+    def enqueue(self, obs: Any, event_id: str, image_bytes: Optional[bytes] = None,
+                payload: Optional[dict] = None, delay_seconds: float = 0.0):
         """Enqueue confirmed gate event for background dispatch."""
         if not self.enabled:
             return
@@ -394,6 +395,7 @@ class CloudOutboxDispatcher:
             'image_bytes': image_bytes if image_bytes is not None else getattr(obs, 'image', None),
             'payload': payload,
             'enqueued_at': time.monotonic(),
+            'not_before': time.monotonic() + max(0.0, float(delay_seconds or 0.0)),
             'retries': 0,
         }
 
@@ -457,6 +459,16 @@ class CloudOutboxDispatcher:
             img = item['image_bytes']
             pre_payload = item.get('payload')
 
+            # A cloud gate event is effectively immutable after acknowledgement.
+            # Allow late OCR from the other calibrated camera to update the
+            # local event/snapshots before constructing the payload.
+            not_before = float(item.get('not_before') or 0.0)
+            remaining = not_before - time.monotonic()
+            if remaining > 0:
+                if self._stop.wait(remaining):
+                    self.queue.task_done()
+                    break
+
             success = False
             try:
                 # Offline backlog is populated directly from SQLite, so apply
@@ -506,12 +518,27 @@ class CloudOutboxDispatcher:
                                 cam_snapshots.setdefault(cam_id, []).append(snap)
 
                             best_by_camera = {}
+                            valid_identity_ids = {o['detection_id'] for o in event_record.get('ocr_results', [])
+                                                  if o.get('valid_check_digit') and o.get('normalized_text') == cntr1}
                             for cam_id, snaps in cam_snapshots.items():
                                 best_snap = None
                                 best_data = None
                                 best_score = -1.0
                                 for snap in snaps:
                                     try:
+                                        # Upload only a frame observed with the
+                                        # validated identity. Generic companion
+                                        # frames can show the yard but miss the
+                                        # container entirely.
+                                        if valid_identity_ids:
+                                            observed = any(
+                                                d.get('id') in valid_identity_ids and
+                                                d.get('camera_id') == snap.get('camera_id') and
+                                                d.get('timestamp') == snap.get('timestamp')
+                                                for d in event_record.get('detections', [])
+                                            )
+                                            if not observed:
+                                                continue
                                         snap_p = self.snapshots.path(snap['image_path'])
                                         if not snap_p.is_file():
                                             continue

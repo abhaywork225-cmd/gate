@@ -119,7 +119,15 @@ class EventManager:
         should_dispatch = obs.confirmed and cloud_ready and (event_id not in self._dispatched_events)
         if self.dispatcher and should_dispatch:
             self._dispatched_events.add(event_id)
-            self.dispatcher.enqueue(obs, event_id)
+            # Do not publish at the first valid OCR vote.  A second camera can
+            # report the rear container a few seconds later; delaying the
+            # immutable cloud POST lets repository.save_observation merge that
+            # evidence into one twin visit.
+            self.dispatcher.enqueue(
+                obs,
+                event_id,
+                delay_seconds=getattr(self.settings, 'cloud_dispatch_grace_seconds', 0.0),
+            )
         if self.runtime and obs.direction in ('EXIT', 'OUT', 'GATE_OUT') and should_dispatch:
             try:
                 cntr = obs.ocr.normalized_text if (obs and obs.ocr and obs.confirmed) else 'Unconfirmed'

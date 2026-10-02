@@ -1,5 +1,18 @@
 # GateVision — Project Change Log
 
+## 2026-10-02 — Grace period before cloud publication
+
+- Confirmed events now wait 10 seconds before the cloud POST so late OCR from
+  another calibrated camera can be merged into the same visit (especially for
+  twin containers). The delay is configurable with
+  `CLOUD_DISPATCH_GRACE_SECONDS`.
+
+## 2026-10-02 — Identity-matched cloud proof
+
+- Cloud proof selection now uploads only a snapshot tied to the validated OCR
+  identity, camera and capture timestamp. Generic side/rear companion frames are
+  excluded when they do not show the detected container.
+
 ## 2026-10-02 — Prevent false twins from one body and its text box
 
 - A `container` detection and its nested `container_number` detection are now

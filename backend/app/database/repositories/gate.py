@@ -12,6 +12,15 @@ from app.snapshots.snapshot_manager import SnapshotManager
 
 def serialize(record):
     result = {column.name: getattr(record, column.name) for column in record.__table__.columns}
+    # Historical dwell rows can retain a twin candidate after another camera
+    # reads a single 40-foot container. Return the supported classification.
+    if isinstance(record, GateEvent) and result.get('is_twin'):
+        distinct_second = bool(result.get('container_number_2') and
+                               result['container_number_2'] != result.get('container_number'))
+        if not distinct_second and str(result.get('iso_code_1') or '').startswith(('4', 'L')):
+            result['is_twin'] = False
+        elif not distinct_second:
+            result['status'] = 'NEEDS_REVIEW'
     return {key: value.isoformat() + 'Z' if isinstance(value, datetime) else value for key, value in result.items()}
 
 
@@ -168,7 +177,15 @@ class GateRepository:
                     else True
                 )
 
-                is_rear_slot = getattr(obs, 'slot_position', 'FRONT') == 'REAR' or obs.origin_key.endswith(':rear')
+                raw_rear_slot = getattr(obs, 'slot_position', 'FRONT') == 'REAR' or obs.origin_key.endswith(':rear')
+                # A camera/origin label alone is not proof of a second
+                # container.  Rear views can contain partial OCR, truck text,
+                # or a re-used tracker ID.  Only a validated full identity may
+                # participate in twin fusion.
+                is_rear_slot = (
+                    raw_rear_slot and bool(number) and len(number) == 11 and
+                    bool(getattr(obs.ocr, 'valid_check_digit', False))
+                )
 
                 if number:
                     existing = session.scalar(select(GateEvent).where(
@@ -386,7 +403,9 @@ class GateRepository:
                 size_str = str(size_type or '')
                 is_40ft = size_str.startswith('4') or '40' in size_str or '45' in size_str
                 obs_is_twin = getattr(obs, 'is_twin', False)
-                is_twin_event = (obs_is_twin or (existing and existing.is_twin) or is_rear_slot or (obs.origin_key.endswith(':front') and not obs.origin_key.endswith(':single'))) and not is_40ft
+                is_twin_event = (
+                    obs_is_twin or (existing and existing.is_twin) or is_rear_slot
+                ) and not is_40ft
                 if created:
                     assign_to_rear = is_twin_event and is_rear_slot
                     session.add(GateEvent(
@@ -450,8 +469,16 @@ class GateRepository:
                         existing.iso_code_2 = None
 
                     if existing.is_twin:
-                        if existing.container_number and existing.container_number_2:
+                        distinct_second = bool(existing.container_number_2 and
+                                               existing.container_number_2 != existing.container_number)
+                        if not distinct_second and str(existing.iso_code_1 or '').startswith(('4', 'L')):
+                            existing.is_twin = False
+                        elif not distinct_second:
+                            existing.status = 'NEEDS_REVIEW'
+                        elif all(str(code or '').startswith('2') for code in (existing.iso_code_1, existing.iso_code_2)):
                             existing.status = 'CONFIRMED'
+                        else:
+                            existing.status = 'NEEDS_REVIEW'
                     elif obs.confirmed:
                         existing.status = 'CONFIRMED'
                 detection_id = str(uuid4())
