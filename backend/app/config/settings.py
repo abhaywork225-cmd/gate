@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     # stored under snapshots, so this must stay bounded on an edge device.
     ocr_spool_max_mb: int = Field(default=2048, ge=256)
     gate_clear_seconds: float = Field(default=7, ge=1, le=60)
+    # Keep a confirmed event local briefly so OCR from a second calibrated
+    # camera can join the same visit before the immutable cloud POST happens.
+    # This is especially important for twin containers where the rear view
+    # often arrives after the front view.
+    cloud_dispatch_grace_seconds: float = Field(default=10, ge=0, le=60)
     # Maximum timestamp distance used when joining two calibrated RTSP views
     # into one candidate truck visit. Keep this bounded for queued traffic.
     cross_camera_view_window_seconds: float = Field(default=8, ge=1, le=30)
