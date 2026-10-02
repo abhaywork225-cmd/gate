@@ -20,7 +20,6 @@ def event(event_id: str, request: Request):
     result = request.app.state.repository.event(event_id)
     if result is None:
         raise HTTPException(404, 'Event not found')
-    result['ocr_crops'] = request.app.state.runtime.ocr_store.event_crops(event_id)
     return result
 
 
