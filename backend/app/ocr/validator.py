@@ -218,6 +218,31 @@ class ContainerValidator:
                         normalized = candidate_prefix + str(calc_cd)
                         subst_found = True
                 if not subst_found:
+                    DIGIT_TO_LETTER = {'0': 'O', '1': 'I', '8': 'B', '5': 'S', '2': 'Z'}
+                    LETTER_TO_DIGIT = {'O': '0', 'I': '1', 'L': '1', 'B': '8', 'S': '5', 'Z': '2', 'J': '3', '|': '1'}
+                    flex_m = re.search(
+                        r'(?<![A-Z0-9])([A-Z0-9])[\s-]*([A-Z0-9])[\s-]*([A-Z0-9])[\s-]*([UJZ0-9O])'
+                        r'((?:[\s-]*[0-9A-Z|]){6,8})(?![0-9A-Z])',
+                        raw.upper()
+                    )
+                    if flex_m:
+                        c1, c2, c3, c4 = flex_m.group(1), flex_m.group(2), flex_m.group(3), flex_m.group(4)
+                        p1 = DIGIT_TO_LETTER.get(c1, c1)
+                        p2 = DIGIT_TO_LETTER.get(c2, c2)
+                        p3 = DIGIT_TO_LETTER.get(c3, c3)
+                        if p1.isalpha() and p2.isalpha() and p3.isalpha():
+                            p4 = 'U' if c4 in ('0', 'O', 'U') else (c4 if c4 in ('J', 'Z') else 'U')
+                            cand_pref = f'{p1}{p2}{p3}{p4}'
+                            digits_raw = flex_m.group(5)
+                            clean_d = ''.join(LETTER_TO_DIGIT.get(ch, ch) for ch in digits_raw if ch not in ' \t\r\n-.:/|')
+                            clean_d = re.sub(r'[^0-9]', '', clean_d)
+                            if len(clean_d) >= 6:
+                                calc_cd = check_digit(cand_pref + clean_d[:6])
+                                read_cd = int(clean_d[6]) if len(clean_d) >= 7 else None
+                                if read_cd is None or read_cd == calc_cd or (read_cd, calc_cd) in CHECK_DIGIT_CONFUSIONS:
+                                    normalized = f'{cand_pref}{clean_d[:6]}{calc_cd}'
+                                    subst_found = True
+                if not subst_found:
                     brand_found = False
                     for brand, bic in BRAND_PREFIX_MAP.items():
                         if brand in raw.upper():

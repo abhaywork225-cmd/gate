@@ -31,7 +31,7 @@ cameras:
     direction: ENTRY
     role: FRONT_TOP
     capture_fps: 25
-    occupancy_roi: [0.35, 0.0, 1.0, 1.0]
+    occupancy_roi: [0.0, 0.0, 1.0, 1.0]
   - id: gate-in-2
     name: Gate IN 2 (Left)
     gate_id: lane-in
@@ -55,7 +55,7 @@ cameras:
     direction: EXIT
     role: FRONT_TOP
     capture_fps: 25
-    occupancy_roi: [0.0, 0.22, 1.0, 1.0]
+    occupancy_roi: [0.0, 0.0, 1.0, 1.0]
   - id: gate-out-2
     name: Gate OUT 2 (Left)
     gate_id: lane-out
@@ -63,7 +63,7 @@ cameras:
     direction: EXIT
     role: LEFT
     capture_fps: 25
-    occupancy_roi: [0.25, 0.0, 1.0, 1.0]
+    occupancy_roi: [0.0, 0.0, 1.0, 1.0]
   - id: gate-out-3
     name: Gate OUT 3 (Rear)
     gate_id: lane-out

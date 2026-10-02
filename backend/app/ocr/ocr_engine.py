@@ -252,8 +252,13 @@ def _extract_text_from_items(items):
 class EasyOCREngine:
     def __init__(self, settings):
         import easyocr
-        self.reader = easyocr.Reader(['en'], gpu=settings.ocr_gpu,
+        import torch
+        network_dir = settings.ocr_model_directory / 'user_network'
+        network_dir.mkdir(parents=True, exist_ok=True)
+        use_gpu = bool(settings.ocr_gpu and torch.cuda.is_available())
+        self.reader = easyocr.Reader(['en'], gpu=use_gpu,
                                      model_storage_directory=str(settings.ocr_model_directory),
+                                     user_network_directory=str(network_dir),
                                      download_enabled=settings.ocr_download_enabled, verbose=False)
 
     def read(self, image) -> OCRRead:

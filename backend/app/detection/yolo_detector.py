@@ -42,8 +42,13 @@ class YoloDetector:
         return output
 
     def detect(self, frame: Frame) -> list[Detection]:
+        device = self.settings.model_device
+        if device != 'cpu':
+            import torch
+            if not torch.cuda.is_available():
+                device = 'cpu'
         results = self.model.predict(source=frame.image, conf=self.settings.confidence_threshold,
-                                     imgsz=self.settings.model_image_size, device=self.settings.model_device,
+                                     imgsz=self.settings.model_image_size, device=device,
                                      verbose=False, rect=False)
         height, width = frame.image.shape[:2]
         detections = []
