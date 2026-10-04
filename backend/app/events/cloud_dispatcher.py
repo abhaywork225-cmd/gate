@@ -422,6 +422,22 @@ class CloudOutboxDispatcher:
             if self.metrics:
                 self.metrics.increment('prosper_queue_dropped')
 
+    def _proof_is_usable(self, image, quality: float) -> bool:
+        """Reject blank, tiny, badly exposed or blurred frames before cloud POST."""
+        if image is None or getattr(image, 'size', 0) == 0:
+            return False
+        try:
+            h, w = image.shape[:2]
+            if h < 240 or w < 320:
+                return False
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            if float(gray.std()) < 8.0:
+                return False
+            minimum = float(getattr(self.settings, 'cloud_min_proof_quality', 5.0))
+            return float(quality) >= minimum
+        except Exception:
+            return False
+
     def _sweep_offline_backlog(self):
         """
         Periodically checks SQLite database for confirmed events that were saved while offline.
@@ -568,7 +584,7 @@ class CloudOutboxDispatcher:
                                         if decoded.shape[0] < 240 or decoded.shape[1] < 320:
                                             continue
                                         quality = self.snapshots.compute_quality(decoded)
-                                        if quality < 2.0:
+                                        if not self._proof_is_usable(decoded, quality):
                                             continue
                                         score = quality
                                         if primary_snap_id and snap.get('id') == primary_snap_id:
@@ -689,7 +705,7 @@ class CloudOutboxDispatcher:
                                         if decoded is None or min(decoded.shape[:2]) < 240:
                                             continue
                                         quality = self.snapshots.compute_quality(decoded)
-                                        if quality < 2.0:
+                                        if not self._proof_is_usable(decoded, quality):
                                             continue
                                         score = quality
                                         if snap.get('id') == event_record.get('rear_snapshot_id'):
