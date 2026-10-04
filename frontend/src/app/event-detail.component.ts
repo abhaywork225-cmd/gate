@@ -298,8 +298,8 @@ export class EventDetailComponent {
   imageErrors = signal<Record<string, boolean>>({});
 
   snapshotUrl(id: string): string {
-    // Derived proof includes the observed number crop and the raw OCR reading.
-    // Full-resolution links retain the unmodified capture.
+    // The proof view is the clean original camera capture. OCR crops are
+    // internal processing artifacts and are never shown as user proof.
     return `/api/snapshots/${id}?proof=true`;
   }
 
