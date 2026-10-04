@@ -48,6 +48,20 @@ def _iso_utc(dt: Any = None) -> str:
     return d.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
 
+def _within_capture_window(left: Any, right: Any, seconds: float = 3.0) -> bool:
+    """Compare camera timestamps safely when joining companion proof frames."""
+    try:
+        l = datetime.fromisoformat(str(left).replace('Z', '+00:00'))
+        r = datetime.fromisoformat(str(right).replace('Z', '+00:00'))
+        if l.tzinfo is None:
+            l = l.replace(tzinfo=timezone.utc)
+        if r.tzinfo is None:
+            r = r.replace(tzinfo=timezone.utc)
+        return abs((l - r).total_seconds()) <= seconds
+    except Exception:
+        return False
+
+
 class ProsperSession:
     """Manages authentication tokens and HTTP requests to Prosper Smart Yard."""
 
@@ -527,14 +541,19 @@ class CloudOutboxDispatcher:
                                 for snap in snaps:
                                     try:
                                         # Upload only a frame observed with the
-                                        # validated identity. Generic companion
-                                        # frames can show the yard but miss the
-                                        # container entirely.
+                                        # validated event/camera. Companion
+                                        # cameras have their own detection ID;
+                                        # requiring the front camera's exact ID
+                                        # incorrectly discarded valid side/rear
+                                        # proof frames.
                                         if valid_identity_ids:
+                                            snap_ts = snap.get('timestamp')
                                             observed = any(
-                                                d.get('id') in valid_identity_ids and
                                                 d.get('camera_id') == snap.get('camera_id') and
-                                                d.get('timestamp') == snap.get('timestamp')
+                                                (
+                                                    d.get('id') in valid_identity_ids or
+                                                    _within_capture_window(d.get('timestamp'), snap_ts)
+                                                )
                                                 for d in event_record.get('detections', [])
                                             )
                                             if not observed:
