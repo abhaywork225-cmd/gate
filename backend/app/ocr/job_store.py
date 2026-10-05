@@ -386,7 +386,16 @@ class OCRJobStore:
                         target = target_dir / f'{job_id}_{source.name}'
                     if source.resolve() != target.resolve():
                         target.parent.mkdir(parents=True, exist_ok=True)
-                        os.replace(source, target)
+                        try:
+                            os.replace(source, target)
+                        except PermissionError:
+                            # A camera/preview process can briefly hold a
+                            # provisional crop open on Windows.  Startup
+                            # reconciliation must not fail the whole backend;
+                            # copy the immutable evidence and leave the source
+                            # for the next cleanup pass.
+                            import shutil
+                            shutil.copy2(source, target)
                     return str(target.relative_to(self.image_root)).replace('\\', '/')
 
                 crop_path = rehome(row['crop'], 'crop')

@@ -70,7 +70,10 @@ class SnapshotManager:
                 # normalize against the actual saved frame dimensions.
                 bw, bh = max(0.0, x2 - x1), max(0.0, y2 - y1)
                 area_ratio = (bw * bh) / float(w * h)
-                if bw < 40.0 or bh < 18.0 or area_ratio < 0.003:
+                # OCR text regions can be narrow on the fixed gate views.  Keep
+                # a modest floor for readable text while still rejecting the
+                # tiny 13-pixel slivers that previously became proof images.
+                if bw < 35.0 or bh < 10.0 or area_ratio < 0.0005:
                     continue
                 # A clipped text box is not reliable proof, even if sharp.
                 if x1 <= 1.0 or y1 <= 1.0 or x2 >= w - 1.0 or y2 >= h - 1.0:
