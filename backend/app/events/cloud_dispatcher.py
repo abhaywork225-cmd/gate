@@ -76,14 +76,18 @@ class ProsperSession:
         self._token_expires_at: float = 0.0
         self._last_auth_attempt: float = 0.0
         self._auth_cooldown_seconds: float = 30.0
+        # A configured bearer token can expire.  After a 401, fall back to the
+        # username/password login flow instead of retrying the same stale token
+        # forever and leaving the outbox permanently offline.
+        self._force_dynamic_auth: bool = False
         self._lock = threading.Lock()
 
     def get_auth_headers(self) -> Dict[str, str]:
         """Return Authorization or API key headers, along with X-Site-Id and X-Client-Id."""
         headers: Dict[str, str] = {}
-        if self.settings.prosper_bearer_token:
+        if self.settings.prosper_bearer_token and not self._force_dynamic_auth:
             headers['Authorization'] = f'Bearer {self.settings.prosper_bearer_token.get_secret_value()}'
-        elif self.settings.prosper_api_key:
+        elif self.settings.prosper_api_key and not self._force_dynamic_auth:
             headers['x-api-key'] = self.settings.prosper_api_key.get_secret_value()
         else:
             # Auto-login credential flow
@@ -264,6 +268,7 @@ class ProsperSession:
             with self._lock:
                 self._token = None
                 self._token_expires_at = 0.0
+                self._force_dynamic_auth = True
             return 'OFFLINE'
         if res.status_code == 409:
             # 409 Conflict: E.g., "Unknown visit for GATE_OUT."
