@@ -92,7 +92,8 @@ class GateRuntime:
         self.validator = ContainerValidator()
         self.tracker = {c.id: TemporalTracker(settings.track_ttl_seconds) for c in cameras}
         self.queue = Queue(maxsize=settings.ocr_queue_size)
-        self.ocr_store = OCRJobStore(settings.upload_directory / 'ocr-spool', settings.ocr_spool_max_mb)
+        self.ocr_store = OCRJobStore(settings.upload_directory / 'ocr-spool', settings.ocr_spool_max_mb,
+                                     image_root=snapshots.root)
         self.ocr_spool_error = None
         self._stop = threading.Event()
         self._accelerator = threading.RLock()
@@ -614,6 +615,10 @@ class GateRuntime:
                 if not gate_event_id:
                     for other_cam in self.cameras:
                         if other_cam.gate_id == camera.gate_id and other_cam.id != camera.id:
+                            if (getattr(camera, 'source_type', 'live') == 'file' and
+                                    getattr(other_cam, 'source_type', 'live') == 'file' and
+                                    not getattr(self.settings, 'allow_file_cross_camera_fusion', False)):
+                                continue
                             other_occ = self.occupancy[other_cam.id].current
                             if other_occ:
                                 # ONLY borrow event_id from a companion camera if the passage is concurrent
@@ -625,7 +630,7 @@ class GateRuntime:
                                     if cand:
                                         gate_event_id = cand
                                         break
-                event_id = gate_event_id or getattr(occupancy, 'event_id', None) or getattr(occupancy, 'provisional_event_id', None)
+                event_id = gate_event_id or getattr(occupancy, 'event_id', None) or getattr(occupancy, 'provisional_event_id', None) or str(uuid4())
                 if event_id and not getattr(occupancy, 'provisional_event_id', None):
                     occupancy.provisional_event_id = event_id
 
@@ -659,6 +664,16 @@ class GateRuntime:
                         if other_worker:
                             other_latest = other_worker.latest()
                             if other_latest and other_latest.image is not None:
+                                if (getattr(camera, 'source_type', 'live') == 'file' and
+                                        getattr(other_cam, 'source_type', 'live') == 'file' and
+                                        not getattr(self.settings, 'allow_file_cross_camera_fusion', False)):
+                                    continue
+                                # A companion is evidence only when captured in
+                                # the same short observation window. Never save
+                                # a stale frame from another truck as proof.
+                                latest_gap = abs((frame.timestamp - other_latest.timestamp).total_seconds())
+                                if latest_gap > self.settings.cross_camera_view_window_seconds:
+                                    continue
                                 companion_frames[other_cam.id] = other_latest.image.copy()
 
                 is_stat = bool((active_slot_obj and active_slot_obj.stationary) or getattr(occupancy, 'stationary', False))
@@ -722,10 +737,11 @@ class GateRuntime:
                         max(region.votes.values(), default=0) >= self.settings.ocr_confirmations):
                     continue
                 _, frame, detection, detections = region.candidates[0]
+                visit_id = passage.visit_id or passage.id
                 job = OCRJob(f'passage:{passage.id}:{region.id}', passage.gate_id,
                              passage.track_id, detection, frame, passage.direction,
                              passage.started, (0,0,1,1), detections,
-                             event_id=passage.id, passage_id=passage.id, region_id=region.id,
+                             event_id=visit_id, passage_id=passage.id, region_id=region.id,
                              passage_metadata={'lane_id':passage.lane_id,'bbox':passage.bbox,
                                                'source_type':passage.source_type})
                 try:
@@ -772,7 +788,7 @@ class GateRuntime:
             if any(self.ocr_store.passage_pending(p.id) for p in group):
                 continue
             first = min(group, key=lambda p:(p.started,p.id))
-            passage = replace(first, regions=[r for p in group for r in p.regions],
+            passage = replace(first, id=(first.visit_id or first.id), regions=[r for p in group for r in p.regions],
                               ambiguous=any(p.ambiguous for p in group))
             self.repository.save_passage(passage, self.snapshots, self.settings.ocr_confirmations)
             with self._state_lock:
@@ -791,7 +807,8 @@ class GateRuntime:
                 passage = Passage(job.passage_id, job.detection.camera_id, job.frame.source_id,
                     job.gate_id, job.passage_metadata['lane_id'], job.direction, job.started_at,
                     job.frame.timestamp, job.track_id, tuple(job.passage_metadata['bbox']),
-                    closed=True, ambiguous=True, source_type=job.passage_metadata.get('source_type','file'))
+                    closed=True, ambiguous=True, source_type=job.passage_metadata.get('source_type','file'),
+                    visit_id=getattr(job, 'event_id', None) or job.passage_id)
                 self.passages.passages[job.passage_id] = passage
         if job.passage_id:
             from app.events.passages import Region

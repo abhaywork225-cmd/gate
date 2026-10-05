@@ -48,6 +48,20 @@ def _iso_utc(dt: Any = None) -> str:
     return d.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
 
+def _within_capture_window(left: Any, right: Any, seconds: float = 3.0) -> bool:
+    """Compare camera timestamps safely when joining companion proof frames."""
+    try:
+        l = datetime.fromisoformat(str(left).replace('Z', '+00:00'))
+        r = datetime.fromisoformat(str(right).replace('Z', '+00:00'))
+        if l.tzinfo is None:
+            l = l.replace(tzinfo=timezone.utc)
+        if r.tzinfo is None:
+            r = r.replace(tzinfo=timezone.utc)
+        return abs((l - r).total_seconds()) <= seconds
+    except Exception:
+        return False
+
+
 class ProsperSession:
     """Manages authentication tokens and HTTP requests to Prosper Smart Yard."""
 
@@ -408,6 +422,22 @@ class CloudOutboxDispatcher:
             if self.metrics:
                 self.metrics.increment('prosper_queue_dropped')
 
+    def _proof_is_usable(self, image, quality: float) -> bool:
+        """Reject blank, tiny, badly exposed or blurred frames before cloud POST."""
+        if image is None or getattr(image, 'size', 0) == 0:
+            return False
+        try:
+            h, w = image.shape[:2]
+            if h < 240 or w < 320:
+                return False
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            if float(gray.std()) < 8.0:
+                return False
+            minimum = float(getattr(self.settings, 'cloud_min_proof_quality', 2.5))
+            return float(quality) >= minimum
+        except Exception:
+            return False
+
     def _sweep_offline_backlog(self):
         """
         Periodically checks SQLite database for confirmed events that were saved while offline.
@@ -493,6 +523,18 @@ class CloudOutboxDispatcher:
                 else:
                     # Query repository for full event record and associated multi-camera snapshots
                     event_record = self.repository.event(event_id) if self.repository else None
+                    if event_record and self.snapshots:
+                        # Use the same canonical capture set exposed by the UI;
+                        # never re-rank a different set for the cloud payload.
+                        manifest = self.snapshots.build_evidence_manifest(
+                            event_record,
+                            min_quality=getattr(self.settings, 'cloud_min_proof_quality', 2.5),
+                        )
+                        if isinstance(manifest, dict):
+                            event_record['evidence_manifest'] = manifest
+                            event_record['snapshots'] = manifest['captures']
+                            event_record['primary_snapshot_id'] = manifest['primary_snapshot_id']
+                            event_record['rear_snapshot_id'] = manifest['rear_snapshot_id']
                     cntr1 = (event_record.get('container_number') if event_record else None) or (obs.ocr.normalized_text if (obs and obs.ocr) else '')
                     cntr2 = event_record.get('container_number_2') if event_record else None
                     is_twin = bool(event_record.get('is_twin')) if event_record else False
@@ -526,15 +568,19 @@ class CloudOutboxDispatcher:
                                 best_score = -1.0
                                 for snap in snaps:
                                     try:
-                                        # Upload only a frame observed with the
-                                        # validated identity. Generic companion
-                                        # frames can show the yard but miss the
-                                        # container entirely.
+                                        # validated event/camera. Companion
+                                        # cameras have their own detection ID;
+                                        # requiring the front camera's exact ID
+                                        # incorrectly discarded valid side/rear
+                                        # proof frames.
                                         if valid_identity_ids:
+                                            snap_ts = snap.get('timestamp')
                                             observed = any(
-                                                d.get('id') in valid_identity_ids and
                                                 d.get('camera_id') == snap.get('camera_id') and
-                                                d.get('timestamp') == snap.get('timestamp')
+                                                (
+                                                    d.get('id') in valid_identity_ids or
+                                                    _within_capture_window(d.get('timestamp'), snap_ts)
+                                                )
                                                 for d in event_record.get('detections', [])
                                             )
                                             if not observed:
@@ -549,7 +595,7 @@ class CloudOutboxDispatcher:
                                         if decoded.shape[0] < 240 or decoded.shape[1] < 320:
                                             continue
                                         quality = self.snapshots.compute_quality(decoded)
-                                        if quality < 2.0:
+                                        if not self._proof_is_usable(decoded, quality):
                                             continue
                                         score = quality
                                         if primary_snap_id and snap.get('id') == primary_snap_id:
@@ -670,7 +716,7 @@ class CloudOutboxDispatcher:
                                         if decoded is None or min(decoded.shape[:2]) < 240:
                                             continue
                                         quality = self.snapshots.compute_quality(decoded)
-                                        if quality < 2.0:
+                                        if not self._proof_is_usable(decoded, quality):
                                             continue
                                         score = quality
                                         if snap.get('id') == event_record.get('rear_snapshot_id'):

@@ -100,9 +100,11 @@ class Settings(BaseSettings):
     confidence_threshold: float = Field(default=0.35, ge=0, le=1)
     ocr_min_confidence: float = Field(default=0.6, ge=0, le=1)
     min_track_hits: int = Field(default=3, ge=1)
-    ocr_confirmations: int = Field(default=2, ge=1)
+    # One valid check-digit read is sufficient once a truck is stationary;
+    # additional samples remain available for twin confirmation and review.
+    ocr_confirmations: int = Field(default=1, ge=1)
     ocr_max_attempts: int = Field(default=4, ge=1)
-    ocr_interval_seconds: float = Field(default=1, gt=0)
+    ocr_interval_seconds: float = Field(default=.5, gt=0)
     ocr_queue_size: int = Field(default=8, ge=1, le=100)
     # The spool is a temporary OCR work area. Definitive event evidence is
     # stored under snapshots, so this must stay bounded on an edge device.
@@ -112,13 +114,20 @@ class Settings(BaseSettings):
     # camera can join the same visit before the immutable cloud POST happens.
     # This is especially important for twin containers where the rear view
     # often arrives after the front view.
-    cloud_dispatch_grace_seconds: float = Field(default=10, ge=0, le=60)
+    cloud_dispatch_grace_seconds: float = Field(default=3, ge=0, le=60)
+    # Minimum sharpness/exposure score for a frame sent as cloud proof.
+    # Frames below this are retained locally for diagnostics but never sent.
+    cloud_min_proof_quality: float = Field(default=2.5, ge=0, le=1000)
     # Maximum timestamp distance used when joining two calibrated RTSP views
     # into one candidate truck visit. Keep this bounded for queued traffic.
-    cross_camera_view_window_seconds: float = Field(default=8, ge=1, le=30)
+    cross_camera_view_window_seconds: float = Field(default=5, ge=1, le=30)
+    # Uploaded videos usually have independent clocks and may show different
+    # trucks. Do not fuse their cameras unless an operator explicitly enables
+    # synchronized-file mode.
+    allow_file_cross_camera_fusion: bool = False
     stationary_drift_threshold: float = Field(default=.02, gt=0, lt=.05)
     stationary_match_iou: float = Field(default=.45, ge=.45, lt=1)
-    stationary_seconds: float = Field(default=1, gt=0)
+    stationary_seconds: float = Field(default=.8, gt=0)
     gate_observation_gap_seconds: float = Field(default=2, gt=0)
     dwell_container_classes: list[str] = ['container', 'container_number', 'iso_code']
     dedup_seconds: float = Field(default=30, gt=0)

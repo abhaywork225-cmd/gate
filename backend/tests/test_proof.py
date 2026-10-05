@@ -14,13 +14,10 @@ def evidence():
     return data, snap, event
 
 
-def test_derived_proof_preserves_source_and_adds_inset():
+def test_proof_returns_clean_source_capture():
     data, snap, event = evidence()
     result = proof_jpeg(data, snap, event)
-    decoded = cv2.imdecode(np.frombuffer(result, np.uint8), 1)
-    assert decoded.shape == (420, 900, 3)
-    assert data == evidence()[0]
-    assert decoded[50:150, 515:745].std() > 10
+    assert result == data
 
 
 def test_unlinked_or_wrong_identity_returns_original():
@@ -31,11 +28,10 @@ def test_unlinked_or_wrong_identity_returns_original():
     assert proof_jpeg(b'broken', snap, event) == b'broken'
 
 
-def test_passage_does_not_apply_full_frame_bbox():
+def test_proof_does_not_apply_full_frame_bbox():
     data, snap, event = evidence()
     result = proof_jpeg(data, snap, {**event, 'lane_id': 'lane-1'})
-    decoded = cv2.imdecode(np.frombuffer(result, np.uint8), 1)
-    assert decoded[50:150, 515:745].std() < 6
+    assert result == data
 
 
 def test_rear_requires_second_identity_and_slot():
@@ -44,4 +40,4 @@ def test_rear_requires_second_identity_and_slot():
     assert proof_jpeg(data, snap, event) == data
     event['container_number_2'] = event['container_number']
     event['detections'][0]['origin_key'] = 'dwell:rear'
-    assert proof_jpeg(data, snap, event) != data
+    assert proof_jpeg(data, snap, event) == data

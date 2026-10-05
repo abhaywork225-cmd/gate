@@ -20,6 +20,11 @@ def event(event_id: str, request: Request):
     result = request.app.state.repository.event(event_id)
     if result is None:
         raise HTTPException(404, 'Event not found')
+    result['evidence_manifest'] = request.app.state.snapshots.build_evidence_manifest(
+        result, min_quality=getattr(request.app.state.runtime.settings, 'cloud_min_proof_quality', 2.5)
+    )
+    result['snapshots'] = result['evidence_manifest']['captures']
+    result['ocr_crops'] = request.app.state.runtime.ocr_store.event_crops(event_id)
     return result
 
 

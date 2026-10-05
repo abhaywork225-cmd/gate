@@ -29,6 +29,52 @@ class SnapshotManager:
         variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         return math.log1p(variance) * exposure
 
+    def build_evidence_manifest(self, event_record: dict, min_quality: float = 2.5) -> dict:
+        """Select one usable camera capture per event/camera for UI and cloud."""
+        snapshots = event_record.get('snapshots') or []
+        by_camera = {}
+        for snap in snapshots:
+            camera_id, image_path = snap.get('camera_id'), snap.get('image_path')
+            if not camera_id or not image_path:
+                continue
+            try:
+                import cv2, numpy as np
+                data = self.path(image_path).read_bytes()
+                decoded = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if decoded is None or decoded.size == 0 or decoded.shape[0] < 240 or decoded.shape[1] < 320:
+                    continue
+                gray = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
+                quality = self.compute_quality(decoded)
+                if float(gray.std()) < 8.0 or quality < min_quality:
+                    continue
+                by_camera.setdefault(camera_id, []).append({**snap, 'quality_score': round(float(quality), 3)})
+            except Exception:
+                continue
+        # The event writer may have already selected a frame because it produced
+        # the accepted OCR result.  That frame is the proof of record and must
+        # not be replaced by a different (possibly sharper but text-invisible)
+        # frame from the same camera.  Otherwise the local OCR result and the
+        # cloud proof image describe different moments.
+        preferred_ids = {
+            value for value in (
+                event_record.get('primary_snapshot_id'),
+                event_record.get('rear_snapshot_id'),
+            ) if value
+        }
+        captures = []
+        for items in by_camera.values():
+            preferred = [item for item in items if item.get('id') in preferred_ids]
+            captures.append(preferred[0] if preferred else max(
+                items, key=lambda item: (item['quality_score'], item.get('timestamp') or '')
+            ))
+        captures.sort(key=lambda item: (item.get('camera_id') or '', item.get('timestamp') or ''))
+        ids = {item['id'] for item in captures}
+        primary = event_record.get('primary_snapshot_id') if event_record.get('primary_snapshot_id') in ids else (captures[0]['id'] if captures else None)
+        rear = event_record.get('rear_snapshot_id') if event_record.get('rear_snapshot_id') in ids else next((item['id'] for item in captures if (item.get('image_path') or '').endswith('_rear.jpg')), None)
+        return {'version': 1, 'event_id': event_record.get('id'), 'captures': captures,
+                'selected_snapshot_ids': [item['id'] for item in captures],
+                'primary_snapshot_id': primary, 'rear_snapshot_id': rear}
+
     @staticmethod
     def compute_similarity(img1, img2) -> float:
         """
@@ -187,6 +233,15 @@ class SnapshotManager:
             os.replace(temp_path, final_path)
         finally:
             temp_path.unlink(missing_ok=True)
+        manifest = self.build_evidence_manifest(event_data)
+        manifest_path = event_dir / 'evidence.json'
+        manifest_temp = event_dir / 'evidence.json.tmp'
+        try:
+            with manifest_temp.open('w', encoding='utf-8') as f:
+                json.dump(manifest, f, indent=2, default=str)
+            os.replace(manifest_temp, manifest_path)
+        finally:
+            manifest_temp.unlink(missing_ok=True)
         return final_path
 
     def remove(self, relative):
