@@ -28,6 +28,58 @@ class SnapshotManager:
         variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         return math.log1p(variance) * exposure
 
+    @staticmethod
+    def _capture_has_visible_container(snapshot: dict, event_record: dict, image) -> bool:
+        """Require a meaningful YOLO container-number box for proof images.
+
+        Whole-frame sharpness is not sufficient proof quality: a sharp frame can
+        contain only a tiny sliver of the truck/container.  Match detections by
+        camera and capture time and reject boxes that are too small or clipped.
+        """
+        import datetime as _dt
+        try:
+            h, w = image.shape[:2]
+            if h <= 0 or w <= 0:
+                return False
+            snap_ts = snapshot.get('timestamp')
+            def parse(value):
+                if not value:
+                    return None
+                text = str(value).replace('Z', '+00:00')
+                try:
+                    return _dt.datetime.fromisoformat(text)
+                except ValueError:
+                    return None
+            snap_dt = parse(snap_ts)
+            camera = snapshot.get('camera_id')
+            candidates = []
+            for detection in event_record.get('detections') or []:
+                if detection.get('camera_id') != camera:
+                    continue
+                if detection.get('class_name') not in ('container_number', 'iso_code'):
+                    continue
+                det_dt = parse(detection.get('timestamp'))
+                if snap_dt and det_dt:
+                    if abs((snap_dt - det_dt).total_seconds()) > 6.0:
+                        continue
+                bbox = detection.get('bbox') or []
+                if len(bbox) != 4:
+                    continue
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+                # Detection coordinates are normally in source-frame pixels;
+                # normalize against the actual saved frame dimensions.
+                bw, bh = max(0.0, x2 - x1), max(0.0, y2 - y1)
+                area_ratio = (bw * bh) / float(w * h)
+                if bw < 40.0 or bh < 18.0 or area_ratio < 0.003:
+                    continue
+                # A clipped text box is not reliable proof, even if sharp.
+                if x1 <= 1.0 or y1 <= 1.0 or x2 >= w - 1.0 or y2 >= h - 1.0:
+                    continue
+                candidates.append((area_ratio, bw, bh))
+            return bool(candidates)
+        except Exception:
+            return False
+
     def build_evidence_manifest(self, event_record: dict, min_quality: float = 2.5) -> dict:
         """Select one usable camera capture per event/camera for UI and cloud."""
         snapshots = event_record.get('snapshots') or []
@@ -45,6 +97,8 @@ class SnapshotManager:
                 gray = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
                 quality = self.compute_quality(decoded)
                 if float(gray.std()) < 8.0 or quality < min_quality:
+                    continue
+                if not self._capture_has_visible_container(snap, event_record, decoded):
                     continue
                 by_camera.setdefault(camera_id, []).append({**snap, 'quality_score': round(float(quality), 3)})
             except Exception:
