@@ -207,12 +207,20 @@ class CameraWorker:
                             self._stop.wait(max(0.005, 1 / (self.config.capture_fps * 1.5)))
                         else:
                             started = time.monotonic()
-                            ok, image = stream.read()
-                            if not ok or image is None:
-                                raise ConnectionError('Read failed')
                             if started >= next_publish:
+                                ok, image = stream.read()
+                                if not ok or image is None:
+                                    raise ConnectionError('Read failed')
                                 self._publish(image)
                                 next_publish = started + 1.0 / self.config.capture_fps
+                            else:
+                                if hasattr(stream, 'grab'):
+                                    if not stream.grab():
+                                        raise ConnectionError('Grab failed')
+                                else:
+                                    ok, _ = stream.read()
+                                    if not ok:
+                                        raise ConnectionError('Read failed')
                             self._set_status('ONLINE', 'receiving')
                             backoff = self.settings.reconnect_initial_seconds
                 except Exception as exc:

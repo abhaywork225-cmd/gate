@@ -30,7 +30,7 @@ cameras:
     source_env: CAMERA_1_RTSP
     direction: ENTRY
     role: FRONT_TOP
-    capture_fps: 25
+    capture_fps: 15
     occupancy_roi: [0.0, 0.0, 1.0, 1.0]
   - id: gate-in-2
     name: Gate IN 2 (Left)
@@ -38,14 +38,14 @@ cameras:
     source_env: CAMERA_2_RTSP
     direction: ENTRY
     role: LEFT
-    capture_fps: 25
+    capture_fps: 15
   - id: gate-in-3
     name: Gate IN 3 (Rear)
     gate_id: lane-in
     source_env: CAMERA_3_RTSP
     direction: ENTRY
     role: REAR
-    capture_fps: 25
+    capture_fps: 15
 
   # --- GATE OUT (3 CAMERAS) ---
   - id: gate-out-1
@@ -54,7 +54,7 @@ cameras:
     source_env: CAMERA_4_RTSP
     direction: EXIT
     role: FRONT_TOP
-    capture_fps: 25
+    capture_fps: 15
     occupancy_roi: [0.0, 0.0, 1.0, 1.0]
   - id: gate-out-2
     name: Gate OUT 2 (Left)
@@ -62,7 +62,7 @@ cameras:
     source_env: CAMERA_5_RTSP
     direction: EXIT
     role: LEFT
-    capture_fps: 25
+    capture_fps: 15
     occupancy_roi: [0.0, 0.0, 1.0, 1.0]
   - id: gate-out-3
     name: Gate OUT 3 (Rear)
@@ -70,5 +70,5 @@ cameras:
     source_env: CAMERA_6_RTSP
     direction: EXIT
     role: REAR
-    capture_fps: 25
+    capture_fps: 15
     enabled: false
