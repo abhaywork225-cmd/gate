@@ -370,6 +370,20 @@ class GateRepository:
                     if active and active.gate_id == obs.gate_id:
                         existing = active
 
+                # Visit-level twin fusion: two different valid 20-ft IDs from
+                # the same shared visit form the two chassis slots even when
+                # neither camera is labelled REAR.
+                if existing and number and existing.container_number and number != existing.container_number:
+                    same_visit = bool(
+                        (getattr(obs, 'event_id', None) and getattr(obs, 'event_id', None) == existing.id)
+                        or (ongoing_event_id and ongoing_event_id == existing.id)
+                    )
+                    existing_iso = str(existing.iso_code_1 or '')
+                    observed_iso = str(getattr(obs.ocr, 'size_type', None) or '')
+                    both_20ft = existing_iso.startswith('2') and observed_iso.startswith('2')
+                    if same_visit and both_20ft and number != (existing.container_number_2 or ''):
+                        is_rear_slot = True
+
                 if obs.origin_key.startswith('dwell:') and existing and not is_rear_slot:
                     # Check if the existing event already belongs to this exact same container
                     is_same_container = False

@@ -49,8 +49,23 @@ class SnapshotManager:
                 by_camera.setdefault(camera_id, []).append({**snap, 'quality_score': round(float(quality), 3)})
             except Exception:
                 continue
-        captures = [max(items, key=lambda item: (item['quality_score'], item.get('timestamp') or ''))
-                    for items in by_camera.values()]
+        # The event writer may have already selected a frame because it produced
+        # the accepted OCR result.  That frame is the proof of record and must
+        # not be replaced by a different (possibly sharper but text-invisible)
+        # frame from the same camera.  Otherwise the local OCR result and the
+        # cloud proof image describe different moments.
+        preferred_ids = {
+            value for value in (
+                event_record.get('primary_snapshot_id'),
+                event_record.get('rear_snapshot_id'),
+            ) if value
+        }
+        captures = []
+        for items in by_camera.values():
+            preferred = [item for item in items if item.get('id') in preferred_ids]
+            captures.append(preferred[0] if preferred else max(
+                items, key=lambda item: (item['quality_score'], item.get('timestamp') or '')
+            ))
         captures.sort(key=lambda item: (item.get('camera_id') or '', item.get('timestamp') or ''))
         ids = {item['id'] for item in captures}
         primary = event_record.get('primary_snapshot_id') if event_record.get('primary_snapshot_id') in ids else (captures[0]['id'] if captures else None)

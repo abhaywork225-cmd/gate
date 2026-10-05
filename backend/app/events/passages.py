@@ -55,6 +55,9 @@ class Passage:
     saved: bool = False
     ambiguous: bool = False
     source_type: str = 'rtsp'
+    # Shared media-session ID. All cameras observing the same truck write into
+    # one evidence folder, while `id` remains the per-camera passage key.
+    visit_id: str | None = None
     clear_since: object = None
     last_measured: object = None
 
@@ -93,6 +96,18 @@ class PassageCollector:
                 passage = Passage(str(uuid4()), camera.id, frame.source_id, camera.gate_id,
                                   lane, camera.direction, frame.timestamp, frame.timestamp,
                                   track.id, track.detection.bbox)
+                # Reuse the active passage's visit ID for concurrent cameras at
+                # the same gate/lane. This is the only folder key for the truck.
+                for other in self.active.values():
+                    if (other.camera_id != camera.id and other.gate_id == camera.gate_id
+                            and other.lane_id == lane and other.direction == camera.direction
+                            and other.source_type == camera.source_type
+                            and abs((frame.timestamp - other.last_seen).total_seconds())
+                            <= float(getattr(self.settings, 'cross_camera_view_window_seconds', 8.0))
+                            and not other.closed):
+                        passage.visit_id = other.visit_id or other.id
+                        break
+                passage.visit_id = passage.visit_id or passage.id
                 self.active[identity] = passage
                 self.passages[passage.id] = passage
                 passage.source_type = camera.source_type
@@ -196,7 +211,7 @@ class PassageCollector:
 
     def status(self, camera_id):
         return {'state': self.health.get(camera_id, 'WAITING_FOR_TRUCK_OR_TRAILER_DETECTION'),
-                'passages': [{'event_id':p.id,'lane_id':p.lane_id,'closed':p.closed,
+                'passages': [{'event_id':p.visit_id or p.id,'passage_id':p.id,'lane_id':p.lane_id,'closed':p.closed,
                               'candidates':len(p.regions)} for p in self.passages.values()
                              if p.camera_id == camera_id and not p.saved]}
 
