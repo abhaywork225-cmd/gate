@@ -31,6 +31,8 @@ class CameraWorker:
         self._dropped = 0
         self._reconnects = 0
         self._sequence = 0
+        self._cached_jpeg = None
+        self._cached_seq = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -95,8 +97,32 @@ class CameraWorker:
                 self._dropped += 1
             self._pending = Frame(self.config.id, timestamp, self._sequence, image, self.source_id)
             self._latest = self._pending
+            self._cached_jpeg = None
+            self._cached_seq = None
             self._last_frame = timestamp.isoformat() + 'Z'
             self._captured.append(time.monotonic())
+
+    def get_jpeg(self):
+        with self._lock:
+            frame = self._latest
+            if frame is None or frame.image is None:
+                return None
+            if self._cached_jpeg is not None and self._cached_seq == frame.sequence:
+                return self._cached_jpeg
+            img = frame.image
+            seq = frame.sequence
+        import cv2
+        if img.shape[1] > 640:
+            img = cv2.resize(img, (640, round(img.shape[0] * 640 / img.shape[1])))
+        ok, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if not ok:
+            return None
+        data = jpeg.tobytes()
+        with self._lock:
+            if self._latest is not None and self._latest.sequence == seq:
+                self._cached_jpeg = data
+                self._cached_seq = seq
+        return data
 
     def take(self):
         with self._lock:
@@ -159,10 +185,10 @@ class CameraWorker:
                         if self._paused.is_set():
                             self._stop.wait(.05)
                             continue
-                        started = time.monotonic()
-                        ok, image = stream.read()
-                        if not ok or image is None:
-                            if self.config.source_type == 'file':
+                        if self.config.source_type == 'file':
+                            started = time.monotonic()
+                            ok, image = stream.read()
+                            if not ok or image is None:
                                 if self.config.loop_file:
                                     if hasattr(stream, 'rewind') and stream.rewind():
                                         video_frame = 0
@@ -173,9 +199,6 @@ class CameraWorker:
                                 else:
                                     self._set_status('OFFLINE', 'file_completed')
                                     return
-                            else:
-                                raise ConnectionError('Read failed')
-                        if self.config.source_type == 'file':
                             video_frame += 1
                             self.video_position_seconds = video_frame / stream.fps
                             self._publish(image)
@@ -183,9 +206,13 @@ class CameraWorker:
                             backoff = self.settings.reconnect_initial_seconds
                             self._stop.wait(max(0.005, 1 / (self.config.capture_fps * 1.5)))
                         else:
+                            started = time.monotonic()
+                            ok, image = stream.read()
+                            if not ok or image is None:
+                                raise ConnectionError('Read failed')
                             if started >= next_publish:
                                 self._publish(image)
-                                next_publish = started + 1 / self.config.capture_fps
+                                next_publish = started + 1.0 / self.config.capture_fps
                             self._set_status('ONLINE', 'receiving')
                             backoff = self.settings.reconnect_initial_seconds
                 except Exception as exc:

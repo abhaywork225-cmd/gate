@@ -9,11 +9,15 @@ router = APIRouter(prefix='/api/cameras', tags=['cameras'])
 
 
 def live_jpeg(runtime, camera_id):
-    import cv2
-    cam = runtime.manager.workers[camera_id]
+    cam = runtime.manager.workers.get(camera_id)
+    if cam is None:
+        return None
+    if hasattr(cam, 'get_jpeg'):
+        return cam.get_jpeg()
     frame = cam.latest()
     if frame is None or frame.image is None:
         return None
+    import cv2
     img = frame.image
     if img.shape[1] > 640:
         img = cv2.resize(img, (640, round(img.shape[0] * 640 / img.shape[1])))

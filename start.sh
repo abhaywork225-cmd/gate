@@ -18,6 +18,9 @@ else
 fi
 
 # Ensure snapshots symlink exists
+export OPENCV_FFMPEG_LOGLEVEL="-8"
+export OPENCV_LOG_LEVEL="SILENT"
+export OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000|probesize;262144|analyzeduration;1000000"
 mkdir -p "$BACKEND_ROOT/snapshots"
 if [ ! -e "$PROJECT_ROOT/snapshots" ]; then
     ln -s "$BACKEND_ROOT/snapshots" "$PROJECT_ROOT/snapshots" 2>/dev/null || true

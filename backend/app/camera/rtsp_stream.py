@@ -9,7 +9,9 @@ class OpenCVStream:
         # Suppress native decoder logs that can include credential-bearing URLs.
         os.environ.setdefault('OPENCV_FFMPEG_LOGLEVEL', '-8')
         os.environ.setdefault('OPENCV_LOG_LEVEL', 'SILENT')
-        os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
+        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
+            'rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000|probesize;262144|analyzeduration;1000000'
+        )
         import cv2
         if hasattr(cv2, 'setLogLevel'):
             cv2.setLogLevel(0)
@@ -23,7 +25,7 @@ class OpenCVStream:
             if use_nvdec and is_tegra and hasattr(cv2, 'CAP_GSTREAMER'):
                 try:
                     gst = (
-                        f'rtspsrc location="{source}" protocols=tcp latency=100 ! '
+                        f'rtspsrc location="{source}" tls-validation-flags=0 protocols=tcp latency=100 ! '
                         'rtph264depay ! h264parse ! nvv4l2decoder ! '
                         'nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink drop=1'
                     )
@@ -53,6 +55,12 @@ class OpenCVStream:
 
     def read(self):
         return self.cap.read()
+
+    def grab(self):
+        return self.cap.grab()
+
+    def retrieve(self):
+        return self.cap.retrieve()
 
     def rewind(self):
         if getattr(self, 'cap', None) and self.cap.isOpened():
