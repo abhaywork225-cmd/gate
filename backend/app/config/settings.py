@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     cloud_dispatch_grace_seconds: float = Field(default=10, ge=0, le=60)
     # Minimum sharpness/exposure score for a frame sent as cloud proof.
     # Frames below this are retained locally for diagnostics but never sent.
-    cloud_min_proof_quality: float = Field(default=5.0, ge=0, le=1000)
+    cloud_min_proof_quality: float = Field(default=2.5, ge=0, le=1000)
     # Maximum timestamp distance used when joining two calibrated RTSP views
     # into one candidate truck visit. Keep this bounded for queued traffic.
     cross_camera_view_window_seconds: float = Field(default=8, ge=1, le=30)

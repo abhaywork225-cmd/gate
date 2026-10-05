@@ -433,7 +433,7 @@ class CloudOutboxDispatcher:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             if float(gray.std()) < 8.0:
                 return False
-            minimum = float(getattr(self.settings, 'cloud_min_proof_quality', 5.0))
+            minimum = float(getattr(self.settings, 'cloud_min_proof_quality', 2.5))
             return float(quality) >= minimum
         except Exception:
             return False
@@ -523,6 +523,18 @@ class CloudOutboxDispatcher:
                 else:
                     # Query repository for full event record and associated multi-camera snapshots
                     event_record = self.repository.event(event_id) if self.repository else None
+                    if event_record and self.snapshots:
+                        # Use the same canonical capture set exposed by the UI;
+                        # never re-rank a different set for the cloud payload.
+                        manifest = self.snapshots.build_evidence_manifest(
+                            event_record,
+                            min_quality=getattr(self.settings, 'cloud_min_proof_quality', 2.5),
+                        )
+                        if isinstance(manifest, dict):
+                            event_record['evidence_manifest'] = manifest
+                            event_record['snapshots'] = manifest['captures']
+                            event_record['primary_snapshot_id'] = manifest['primary_snapshot_id']
+                            event_record['rear_snapshot_id'] = manifest['rear_snapshot_id']
                     cntr1 = (event_record.get('container_number') if event_record else None) or (obs.ocr.normalized_text if (obs and obs.ocr) else '')
                     cntr2 = event_record.get('container_number_2') if event_record else None
                     is_twin = bool(event_record.get('is_twin')) if event_record else False

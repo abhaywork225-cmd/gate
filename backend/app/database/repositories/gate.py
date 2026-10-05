@@ -708,6 +708,13 @@ class GateRepository:
                             and d.origin_key.endswith(':rear') == rear]
                 if not eligible:
                     eligible = [d for d in detections if d.id in matching]
+
+                def _cam_priority(d):
+                    cam = (d.camera_id or '').lower()
+                    is_rear_cam = any(k in cam for k in ('3', 'rear', 'back'))
+                    return (0 if is_rear_cam else 1) if rear else (1 if is_rear_cam else 0)
+
+                eligible.sort(key=_cam_priority)
                 for detection in eligible:
                     candidate = next((s for s in snapshots_list
                                       if s['camera_id'] == detection.camera_id
