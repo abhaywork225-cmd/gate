@@ -114,6 +114,8 @@ class GateRuntime:
         self.ocr = None
         self.model_status = {'detector': 'DISABLED', 'ocr': 'DISABLED', 'error_type': None}
         self.last_processing_error = None
+        self._prev_rois = {}
+        self._last_infer_times = {}
 
     def start(self):
         self._recover_passages()
@@ -509,6 +511,42 @@ class GateRuntime:
             if frame.sequence % (camera.frame_skip + 1):
                 self.metrics.increment('frames_skipped')
                 return
+
+            # Lightweight motion gating for live RTSP streams:
+            # If the camera currently has no active occupant and ran inference recently (< 6.0s),
+            # check if there is visual motion in its occupancy ROI.
+            # Static empty scenes take ~0.2ms, freeing compute for cameras with passing trucks.
+            is_live = getattr(worker.config, 'source_type', 'rtsp') != 'file'
+            has_occupant = bool(self.occupancy[camera_id].current)
+            time_since_infer = now - self._last_infer_times.get(camera_id, 0.0)
+
+            if is_live and not has_occupant and time_since_infer < 6.0 and getattr(frame, 'image', None) is not None:
+                h, w = frame.image.shape[:2]
+                rx1, ry1, rx2, ry2 = camera.occupancy_roi
+                x1, y1 = max(0, int(rx1 * w)), max(0, int(ry1 * h))
+                x2, y2 = min(w, int(rx2 * w)), min(h, int(ry2 * h))
+                if x2 > x1 and y2 > y1:
+                    import cv2
+                    crop_small = cv2.resize(frame.image[y1:y2, x1:x2], (64, 36))
+                    gray = cv2.cvtColor(crop_small, cv2.COLOR_BGR2GRAY)
+                    prev_gray = self._prev_rois.get(camera_id)
+                    self._prev_rois[camera_id] = gray
+                    if prev_gray is not None:
+                        diff = cv2.absdiff(prev_gray, gray)
+                        # Mean pixel change < 3.0 means scene is completely static
+                        if (diff > 15).sum() < 25 and diff.mean() < 3.0:
+                            next_at[camera_id] = now + 0.3
+                            return
+            elif getattr(frame, 'image', None) is not None:
+                h, w = frame.image.shape[:2]
+                rx1, ry1, rx2, ry2 = camera.occupancy_roi
+                x1, y1 = max(0, int(rx1 * w)), max(0, int(ry1 * h))
+                x2, y2 = min(w, int(rx2 * w)), min(h, int(ry2 * h))
+                if x2 > x1 and y2 > y1:
+                    import cv2
+                    self._prev_rois[camera_id] = cv2.cvtColor(cv2.resize(frame.image[y1:y2, x1:x2], (64, 36)), cv2.COLOR_BGR2GRAY)
+
+            self._last_infer_times[camera_id] = now
             next_at[camera_id] = now + 1 / (camera.inference_fps or self.settings.inference_fps)
             self.process_frame(camera, frame)
 
