@@ -80,7 +80,17 @@ class SnapshotManager:
                 if x1 <= 1.0 or y1 <= 1.0 or x2 >= w - 1.0 or y2 >= h - 1.0:
                     continue
                 candidates.append((area_ratio, bw, bh))
-            return bool(candidates)
+            if candidates:
+                return True
+
+            # Companion camera frames are captured at the same instant as the
+            # OCR observation and are stored as {event_id}/{camera_id}.jpg.
+            # They intentionally do not have a second OCR detection row.  The
+            # old rule discarded these valid views even though the image was
+            # present in the event folder, causing cloud payloads to contain
+            # only the primary camera image.
+            image_path = str(snapshot.get('image_path') or '').replace('\\', '/')
+            return image_path.rsplit('/', 1)[-1] == f'{camera}.jpg'
         except Exception:
             return False
 

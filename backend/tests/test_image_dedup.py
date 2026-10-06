@@ -125,3 +125,73 @@ def test_canonical_event_id_resolves_duplicate_by_image(tmp_path):
     # canonical_event_id should resolve ev-2-duplicate to ev-1-primary
     canonical = repo.canonical_event_id("ev-2-duplicate", max_gap_seconds=300, snapshots=snapshots)
     assert canonical == "ev-1-primary"
+
+
+def test_congestion_dwell_does_not_merge_different_container_ids(tmp_path):
+    from app.config.settings import CameraConfig
+    db = Database("sqlite:///:memory:")
+    db.initialize()
+    repo = GateRepository(db)
+    snapshots = SnapshotManager(tmp_path)
+    repo.sync_cameras([CameraConfig(id='gate-in-1', name='Gate In 1', gate_id='lane-in', source_env='CAM1')])
+
+    base_time = datetime(2026, 10, 6, 6, 50, 0, tzinfo=timezone.utc)
+    rng = np.random.default_rng(300)
+    img = rng.integers(50, 200, (480, 640, 3), dtype=np.uint8)
+
+    # 1. First dwell observation: MSNU9152637 at t=0
+    det1 = Detection("gate-in-1", base_time, "container", 0.9, (10, 10, 100, 100))
+    val1 = Validation("MSNU 915263 7", "MSNU9152637", 0.98, True, True, "VALID", size_type="45G1")
+    obs1 = Observation(
+        origin_key="dwell:gate-in-1:orig_dwell_1",
+        gate_id="lane-in",
+        track_id=1,
+        detection=det1,
+        ocr=val1,
+        direction="ENTRY",
+        image=img,
+        started_at=base_time,
+        confirmed=True
+    )
+    ev_id1, created1 = repo.save_observation(obs1, snapshots, dedup_seconds=30, same_container_window_seconds=2400)
+    assert created1 is True
+
+    # 2. Five minutes later a different valid ID must remain a new visit.
+    # Same-line containers are common in a queue; OCR similarity is not a
+    # physical identity and must not fuse them.
+    t2 = base_time + timedelta(minutes=5)
+    det2 = Detection("gate-in-1", t2, "container", 0.9, (15, 12, 105, 102))
+    val2 = Validation("MSNU 115263 0", "MSNU1152630", 0.94, True, True, "VALID", size_type="45G1")
+    obs2 = Observation(
+        origin_key="dwell:gate-in-1:orig_dwell_2",
+        gate_id="lane-in",
+        track_id=2,
+        detection=det2,
+        ocr=val2,
+        direction="ENTRY",
+        image=img,
+        started_at=t2,
+        confirmed=True
+    )
+    ev_id2, created2 = repo.save_observation(obs2, snapshots, dedup_seconds=30, same_container_window_seconds=2400)
+    assert created2 is True
+    assert ev_id2 != ev_id1
+
+    # 3. Another different ID after 12 minutes is also a separate visit.
+    t3 = base_time + timedelta(minutes=12)
+    det3 = Detection("gate-in-1", t3, "container", 0.88, (18, 14, 108, 104))
+    val3 = Validation("MSNU 152631 9", "MSNU1526319", 0.91, True, True, "VALID", size_type="45G1")
+    obs3 = Observation(
+        origin_key="dwell:gate-in-1:orig_dwell_3",
+        gate_id="lane-in",
+        track_id=3,
+        detection=det3,
+        ocr=val3,
+        direction="ENTRY",
+        image=img,
+        started_at=t3,
+        confirmed=True
+    )
+    ev_id3, created3 = repo.save_observation(obs3, snapshots, dedup_seconds=30, same_container_window_seconds=2400)
+    assert created3 is True
+    assert ev_id3 not in {ev_id1, ev_id2}

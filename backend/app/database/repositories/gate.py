@@ -26,15 +26,18 @@ def serialize(record):
 
 
 def ocr_similarity_score(s1: str | None, s2: str | None) -> float:
-    """Return character overlap ratio (0.0 to 1.0) between two OCR strings."""
+    """Return character overlap ratio (0.0 to 1.0) between two OCR strings,
+    robust to single character shifts, insertions, and deletions."""
     if not s1 or not s2:
         return 0.0
     s1, s2 = s1.strip().upper(), s2.strip().upper()
     if s1 == s2:
         return 1.0
-    common = sum(1 for a, b in zip(s1, s2) if a == b)
-    max_l = max(len(s1), len(s2))
-    return common / max_l if max_l > 0 else 0.0
+    import difflib
+    pos_common = sum(1 for a, b in zip(s1, s2) if a == b)
+    pos_ratio = pos_common / max(len(s1), len(s2))
+    seq_ratio = difflib.SequenceMatcher(None, s1, s2).ratio()
+    return max(pos_ratio, seq_ratio)
 
 
 def datetime_diff_seconds(dt1: datetime | None, dt2: datetime | None) -> float:
@@ -231,8 +234,8 @@ class GateRepository:
                             GateEvent.timestamp >= obs.detection.frame_timestamp - long_delta,
                             GateEvent.timestamp <= obs.detection.frame_timestamp,
                         ).order_by(GateEvent.timestamp.asc()))
-                        if not existing and len(number) == 11 and number[4:].isdigit():
-                            suffix = number[4:]
+                        if not existing and number:
+                            suffix = number[4:] if (len(number) == 11 and number[4:].isdigit()) else ''
                             candidates = session.scalars(select(GateEvent).where(
                                 GateEvent.gate_id == obs.gate_id,
                                 direction_match,
@@ -242,10 +245,13 @@ class GateRepository:
                             ).order_by(GateEvent.timestamp.asc())).all()
                             for cand in candidates:
                                 c1, c2 = cand.container_number or '', cand.container_number_2 or ''
-                                if ((len(c1) == 11 and c1[4:] == suffix) or
-                                        (len(c2) == 11 and c2[4:] == suffix)):
+                                if suffix and ((len(c1) == 11 and c1[4:] == suffix) or (len(c2) == 11 and c2[4:] == suffix)):
                                     existing = cand
                                     break
+                                # Never merge on owner prefix or fuzzy OCR alone.
+                                # Two different containers from the same line are
+                                # common in a queue.  Only exact IDs or the same
+                                # serial suffix (above) may recover a tracker reset.
 
                     # Visual and capture-timestamp deduplication:
                     # When OCR produces different strings for the same container (e.g. MSMU5388338 vs MSMU5386335),
@@ -292,7 +298,23 @@ class GateRepository:
                             match_found = False
 
                             # 1. Compare snapshots across matching camera
-                            if snapshots and hasattr(snapshots, 'path') and getattr(obs, 'image', None) is not None:
+                            # A static camera background can look nearly
+                            # identical for consecutive trucks.  Never let
+                            # image similarity override two distinct valid
+                            # container IDs; twin fusion has its own explicit
+                            # branch above.
+                            distinct_valid_ids = bool(
+                                number and c_num and number != c_num and
+                                len(number) == 11 and len(c_num) == 11
+                            )
+                            # A sub-second duplicate with the same camera
+                            # image can be an OCR character error.  Outside
+                            # that tiny interval, two valid IDs are separate
+                            # trucks even when the background is identical.
+                            visual_same_capture = distinct_valid_ids and time_diff <= 1.0
+                            if ((not distinct_valid_ids or visual_same_capture) and snapshots and
+                                    hasattr(snapshots, 'path') and
+                                    getattr(obs, 'image', None) is not None):
                                 cam_id = obs.detection.camera_id
                                 cand_img_path = None
                                 try:
@@ -322,9 +344,10 @@ class GateRepository:
                             # 2. Check OCR fuzzy overlap + short timestamp gap
                             c_num = cand.container_number or ''
                             ocr_sim = ocr_similarity_score(number, c_num)
-                            if time_diff <= 15.0 and ocr_sim >= 0.70:
+                            if time_diff <= 5.0 and ocr_sim >= 0.90:
                                 match_found = True
-                            elif time_diff <= 2.0 and not cand.is_twin:
+                            elif (time_diff <= 2.0 and not cand.is_twin and
+                                  not (number and c_num and number != c_num)):
                                 # Sub-second or <= 2s passage on same lane is physically the same vehicle
                                 match_found = True
 
@@ -396,6 +419,8 @@ class GateRepository:
                         elif len(number) == 11 and number[4:].isdigit():
                             if (len(c1) == 11 and c1[4:] == number[4:]) or (len(c2) == 11 and c2[4:] == number[4:]):
                                 is_same_container = True
+                        # Do not use a fuzzy owner-prefix comparison here.  It
+                        # incorrectly binds consecutive same-line containers.
 
                     # Only reset existing = None if it is a new cleared passage of a DIFFERENT or UNIDENTIFIED vehicle
                     if not is_same_container:
@@ -934,9 +959,16 @@ class GateRepository:
                     if ev1.gate_id != ev2.gate_id:
                         continue
 
-                    # Check image similarity
+                    c1, c2 = ev1.container_number or '', ev2.container_number or ''
+                    distinct_valid_ids = bool(
+                        c1 and c2 and c1 != c2 and len(c1) == 11 and len(c2) == 11
+                    )
+
+                    # Check image similarity only when OCR has not already
+                    # proven these are two different containers.  Static
+                    # backgrounds otherwise make queued trucks look identical.
                     is_match = False
-                    if snap_mgr and hasattr(snap_mgr, 'path'):
+                    if not distinct_valid_ids and snap_mgr and hasattr(snap_mgr, 'path'):
                         for cam_id in ['gate-in-1', 'gate-in-2', 'gate-in-3', 'gate-out-1', 'gate-out-2', 'gate-out-3']:
                             try:
                                 p1 = snap_mgr.path(f"{ev1.id}/{cam_id}.jpg")
@@ -949,11 +981,11 @@ class GateRepository:
                             except Exception:
                                 pass
 
-                    c1, c2 = ev1.container_number or '', ev2.container_number or ''
                     ocr_sim = ocr_similarity_score(c1, c2)
-                    if gap <= 15.0 and ocr_sim >= 0.70:
+                    if gap <= 5.0 and ocr_sim >= 0.90:
                         is_match = True
-                    elif gap <= 1.5 and not ev1.is_twin and not ev2.is_twin:
+                    elif (gap <= 1.5 and not ev1.is_twin and not ev2.is_twin and
+                          not distinct_valid_ids):
                         is_match = True
 
                     if is_match:
@@ -1016,7 +1048,10 @@ class GateRepository:
                 # Distinct container numbers must NEVER be merged as duplicates by static camera background similarity.
                 if num and c_num and num != c_num:
                     ocr_sim = ocr_similarity_score(num, c_num)
-                    if not (time_diff <= 15.0 and ocr_sim >= 0.70):
+                    # Similar-looking OCR is not a physical identity.  The
+                    # lane visit/ongoing event binds tracker churn; canonical
+                    # fallback accepts only near-identical OCR.
+                    if not (time_diff <= 5.0 and ocr_sim >= 0.90) and time_diff > 1.0:
                         continue
 
                 # Image comparison across matching cameras
@@ -1034,11 +1069,12 @@ class GateRepository:
 
                 # Fuzzy OCR match within short window
                 ocr_sim = ocr_similarity_score(event.container_number, cand.container_number)
-                if time_diff <= 15.0 and ocr_sim >= 0.70:
+                if time_diff <= 5.0 and ocr_sim >= 0.90:
                     return cand.id if cand.timestamp <= event.timestamp else cand.id
 
                 # Sub-second physical passage: same lane within 2.0s
-                if time_diff <= 2.0 and not cand.is_twin and not event.is_twin:
+                if (time_diff <= 2.0 and not cand.is_twin and not event.is_twin and
+                        not (num and c_num and num != c_num)):
                     return cand.id if cand.timestamp <= event.timestamp else cand.id
 
             return event_id

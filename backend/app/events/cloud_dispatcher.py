@@ -589,7 +589,18 @@ class CloudOutboxDispatcher:
                                                 for d in event_record.get('detections', [])
                                             )
                                             if not observed:
-                                                continue
+                                                # Companion frames are persisted
+                                                # as {event_id}/{camera_id}.jpg
+                                                # and are linked to this event,
+                                                # but they do not get a separate
+                                                # OCR detection row.  Keep them
+                                                # when their own quality checks
+                                                # pass; otherwise only the OCR
+                                                # camera reaches Prosper.
+                                                image_path = str(snap.get('image_path') or '').replace('\\', '/')
+                                                is_companion = image_path.rsplit('/', 1)[-1] == f'{snap.get("camera_id")}.jpg'
+                                                if not is_companion:
+                                                    continue
                                         snap_p = self.snapshots.path(snap['image_path'])
                                         if not snap_p.is_file():
                                             continue
