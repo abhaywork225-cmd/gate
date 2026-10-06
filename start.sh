@@ -17,6 +17,9 @@ else
     exit 1
 fi
 
+# Ensure CUDA and TensorRT library paths are set for GPU acceleration
+export LD_LIBRARY_PATH="/home/arctec/cuda_libs/dist/usr/local/cuda-11.4/targets/aarch64-linux/lib:/home/arctec/cuda_libs/dist/usr/lib/aarch64-linux-gnu:/home/arctec/cuda_libs/dist/usr/lib/aarch64-linux-gnu/openblas-pthread:/usr/lib/aarch64-linux-gnu/tegra:${LD_LIBRARY_PATH:-}"
+
 # Ensure snapshots symlink exists
 export OPENCV_FFMPEG_LOGLEVEL="-8"
 export OPENCV_LOG_LEVEL="SILENT"
