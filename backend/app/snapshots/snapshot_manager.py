@@ -57,7 +57,7 @@ class SnapshotManager:
             for detection in event_record.get('detections') or []:
                 if detection.get('camera_id') != camera:
                     continue
-                if detection.get('class_name') not in ('container_number', 'iso_code'):
+                if detection.get('class_name') not in ('container', 'container_number', 'iso_code'):
                     continue
                 det_dt = parse(detection.get('timestamp'))
                 if snap_dt and det_dt:
