@@ -127,7 +127,7 @@ def test_canonical_event_id_resolves_duplicate_by_image(tmp_path):
     assert canonical == "ev-1-primary"
 
 
-def test_congestion_dwell_fusion_with_ocr_variations(tmp_path):
+def test_congestion_dwell_does_not_merge_different_container_ids(tmp_path):
     from app.config.settings import CameraConfig
     db = Database("sqlite:///:memory:")
     db.initialize()
@@ -156,7 +156,9 @@ def test_congestion_dwell_fusion_with_ocr_variations(tmp_path):
     ev_id1, created1 = repo.save_observation(obs1, snapshots, dedup_seconds=30, same_container_window_seconds=2400)
     assert created1 is True
 
-    # 2. Inched forward after 5 minutes (congestion): OCR reads MSNU1152630 (9 read as 1, 7 read as 0)
+    # 2. Five minutes later a different valid ID must remain a new visit.
+    # Same-line containers are common in a queue; OCR similarity is not a
+    # physical identity and must not fuse them.
     t2 = base_time + timedelta(minutes=5)
     det2 = Detection("gate-in-1", t2, "container", 0.9, (15, 12, 105, 102))
     val2 = Validation("MSNU 115263 0", "MSNU1152630", 0.94, True, True, "VALID", size_type="45G1")
@@ -172,10 +174,10 @@ def test_congestion_dwell_fusion_with_ocr_variations(tmp_path):
         confirmed=True
     )
     ev_id2, created2 = repo.save_observation(obs2, snapshots, dedup_seconds=30, same_container_window_seconds=2400)
-    assert created2 is False
-    assert ev_id2 == ev_id1
+    assert created2 is True
+    assert ev_id2 != ev_id1
 
-    # 3. Inched forward after 12 minutes: OCR reads MSNU1526319 (shifted/dropped digit)
+    # 3. Another different ID after 12 minutes is also a separate visit.
     t3 = base_time + timedelta(minutes=12)
     det3 = Detection("gate-in-1", t3, "container", 0.88, (18, 14, 108, 104))
     val3 = Validation("MSNU 152631 9", "MSNU1526319", 0.91, True, True, "VALID", size_type="45G1")
@@ -191,5 +193,5 @@ def test_congestion_dwell_fusion_with_ocr_variations(tmp_path):
         confirmed=True
     )
     ev_id3, created3 = repo.save_observation(obs3, snapshots, dedup_seconds=30, same_container_window_seconds=2400)
-    assert created3 is False
-    assert ev_id3 == ev_id1
+    assert created3 is True
+    assert ev_id3 not in {ev_id1, ev_id2}

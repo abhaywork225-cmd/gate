@@ -122,7 +122,9 @@ class Settings(BaseSettings):
     cloud_min_proof_quality: float = Field(default=2.5, ge=0, le=1000)
     # Maximum timestamp distance used when joining two calibrated RTSP views
     # into one candidate truck visit. Keep this bounded for queued traffic.
-    cross_camera_view_window_seconds: float = Field(default=20, ge=1, le=60)
+    # Cameras on one gate are timestamp-joined only briefly.  A long window
+    # causes the next queued truck to be treated as another view of this one.
+    cross_camera_view_window_seconds: float = Field(default=8, ge=1, le=60)
     # Uploaded videos usually have independent clocks and may show different
     # trucks. Do not fuse their cameras unless an operator explicitly enables
     # synchronized-file mode.
@@ -136,7 +138,9 @@ class Settings(BaseSettings):
     # A tracker can be re-created when a queued truck remains in view.  Keep
     # one persisted event for the same confirmed container/lane/direction for
     # this long, while leaving normal (unidentified) passage dedup unchanged.
-    same_container_event_window_seconds: float = Field(default=2400, ge=60, le=7200)
+    # This is a recovery window for tracker churn, not a visit identity.  The
+    # active lane/visit ID is the primary key; this fallback must stay short.
+    same_container_event_window_seconds: float = Field(default=600, ge=60, le=7200)
     track_ttl_seconds: float = Field(default=5, gt=0)
     snapshot_directory: Path = Path('snapshots')
     upload_directory: Path = Path('uploads')
