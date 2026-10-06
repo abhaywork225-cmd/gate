@@ -108,18 +108,21 @@ class Settings(BaseSettings):
     # The spool is a temporary OCR work area. Definitive event evidence is
     # stored under snapshots, so this must stay bounded on an edge device.
     ocr_spool_max_mb: int = Field(default=2048, ge=256)
-    gate_clear_seconds: float = Field(default=7, ge=1, le=60)
+    gate_clear_seconds: float = Field(default=7, ge=1, le=120)
     # Keep a confirmed event local briefly so OCR from a second calibrated
     # camera can join the same visit before the immutable cloud POST happens.
     # This is especially important for twin containers where the rear view
     # often arrives after the front view.
-    cloud_dispatch_grace_seconds: float = Field(default=3, ge=0, le=60)
+    # Give the other calibrated gate cameras time to contribute a rear/twin
+    # identity before the cloud transaction becomes immutable.  Operators can
+    # tune this per site through CLOUD_DISPATCH_GRACE_SECONDS.
+    cloud_dispatch_grace_seconds: float = Field(default=10, ge=0, le=60)
     # Minimum sharpness/exposure score for a frame sent as cloud proof.
     # Frames below this are retained locally for diagnostics but never sent.
     cloud_min_proof_quality: float = Field(default=2.5, ge=0, le=1000)
     # Maximum timestamp distance used when joining two calibrated RTSP views
     # into one candidate truck visit. Keep this bounded for queued traffic.
-    cross_camera_view_window_seconds: float = Field(default=5, ge=1, le=30)
+    cross_camera_view_window_seconds: float = Field(default=20, ge=1, le=60)
     # Uploaded videos usually have independent clocks and may show different
     # trucks. Do not fuse their cameras unless an operator explicitly enables
     # synchronized-file mode.
@@ -133,7 +136,7 @@ class Settings(BaseSettings):
     # A tracker can be re-created when a queued truck remains in view.  Keep
     # one persisted event for the same confirmed container/lane/direction for
     # this long, while leaving normal (unidentified) passage dedup unchanged.
-    same_container_event_window_seconds: float = Field(default=900, ge=60, le=3600)
+    same_container_event_window_seconds: float = Field(default=2400, ge=60, le=7200)
     track_ttl_seconds: float = Field(default=5, gt=0)
     snapshot_directory: Path = Path('snapshots')
     upload_directory: Path = Path('uploads')

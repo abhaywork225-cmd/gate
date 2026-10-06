@@ -110,6 +110,14 @@ class ViewOccupancy:
         all_boxes = [(d, normalized(d.bbox, frame.image.shape)) for d in detections
                      if d.class_name in dwell_classes]
         zone = camera.occupancy_roi
+        # A configured crossing line is not proof of departure in a congested
+        # gate: a truck can creep across it and reverse. Retain the visit while
+        # any eligible container evidence is still visible in the lane ROI.
+        visible_in_zone = any(
+            iou(b, zone) > 0 and box_area(b) >=
+            (0.005 if d.class_name == 'container' else 0.0001)
+            for d, b in all_boxes
+        )
 
         # 1. Filter raw candidates: must intersect occupancy ROI, center within ROI, not past exit, and realistic container/text size
         raw_candidates = []
@@ -140,19 +148,10 @@ class ViewOccupancy:
                 state.stationary = False
             state.last_measured = now
 
-            # Check if all tracked container slots departed past the exit boundary
-            if state.slots and all(self._past_exit(s.bbox, camera) for s in state.slots.values()):
-                self.current = None
-                return None
-
-            # Backward-compat: single box departed past exit
-            matched_dep = max(all_boxes, key=lambda item: iou(state.bbox, item[1]), default=None)
-            if matched_dep and iou(state.bbox, matched_dep[1]) > 0.15:
-                if not self._past_exit(state.bbox, camera) and self._past_exit(matched_dep[1], camera):
-                    self.current = None
-                    return None
-
             if not candidates:
+                if visible_in_zone:
+                    state.clear_since = None
+                    return None
                 state.clear_since = state.clear_since or now
                 if (now - state.clear_since).total_seconds() >= self.settings.gate_clear_seconds:
                     self.current = None

@@ -48,15 +48,37 @@ def test_different_box_cannot_steal_occupied_zone(settings, camera):
     assert view.current.clear_since is None
 
 
-def test_explicit_exit_line_unlocks_and_does_not_reclaim_departed_box(settings, camera):
+def test_exit_line_does_not_unlock_while_container_still_visible(settings, camera):
     camera.gate_exit_axis = 'x'
     camera.gate_exit_position = .5
     view = ViewOccupancy(settings)
     view.update(camera, *measured(0, ((45,10,95,90),)))
     view.confirm(view.current.origin, 'event')
     view.update(camera, *measured(1, ((52,10,100,90),)))
-    assert view.current is None
+    assert view.current is not None
     view.update(camera, *measured(2, ((53,10,100,90),)))
+    assert view.current is not None
+    for t in range(3, 11):
+        view.update(camera, *measured(t, ()))
+    assert view.current is None
+
+
+def test_queue_creep_and_reverse_keeps_confirmed_visit(settings, camera):
+    camera.gate_exit_axis = 'x'
+    camera.gate_exit_position = .5
+    view = ViewOccupancy(settings)
+    view.update(camera, *measured(0, ((45,10,95,90),)))
+    origin = view.current.origin
+    view.confirm(origin, 'waiting-truck', 'MSNU1152630')
+    for t in range(1, 240):
+        # Alternate across the line, including brief detector dropouts.
+        boxes = () if t % 13 == 0 else (((52,10,100,90),) if t % 2 else ((45,10,95,90),))
+        view.update(camera, *measured(t, boxes))
+        assert view.current is not None
+        assert view.current.origin == origin
+        assert view.current.event_id == 'waiting-truck'
+    for t in range(240, 248):
+        view.update(camera, *measured(t, ()))
     assert view.current is None
 
 
@@ -193,4 +215,3 @@ def test_container_number_alone_triggers_occupancy(settings, camera):
     assert selected.class_name == 'container_number'
     assert view.current is not None
     assert view.status()['state'] in ('TRACKING', 'OCCUPIED')
-

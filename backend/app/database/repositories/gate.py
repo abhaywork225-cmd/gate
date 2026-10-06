@@ -25,15 +25,18 @@ def serialize(record):
 
 
 def ocr_similarity_score(s1: str | None, s2: str | None) -> float:
-    """Return character overlap ratio (0.0 to 1.0) between two OCR strings."""
+    """Return character overlap ratio (0.0 to 1.0) between two OCR strings,
+    robust to single character shifts, insertions, and deletions."""
     if not s1 or not s2:
         return 0.0
     s1, s2 = s1.strip().upper(), s2.strip().upper()
     if s1 == s2:
         return 1.0
-    common = sum(1 for a, b in zip(s1, s2) if a == b)
-    max_l = max(len(s1), len(s2))
-    return common / max_l if max_l > 0 else 0.0
+    import difflib
+    pos_common = sum(1 for a, b in zip(s1, s2) if a == b)
+    pos_ratio = pos_common / max(len(s1), len(s2))
+    seq_ratio = difflib.SequenceMatcher(None, s1, s2).ratio()
+    return max(pos_ratio, seq_ratio)
 
 
 def datetime_diff_seconds(dt1: datetime | None, dt2: datetime | None) -> float:
@@ -230,8 +233,8 @@ class GateRepository:
                             GateEvent.timestamp >= obs.detection.frame_timestamp - long_delta,
                             GateEvent.timestamp <= obs.detection.frame_timestamp,
                         ).order_by(GateEvent.timestamp.asc()))
-                        if not existing and len(number) == 11 and number[4:].isdigit():
-                            suffix = number[4:]
+                        if not existing and number:
+                            suffix = number[4:] if (len(number) == 11 and number[4:].isdigit()) else ''
                             candidates = session.scalars(select(GateEvent).where(
                                 GateEvent.gate_id == obs.gate_id,
                                 direction_match,
@@ -241,9 +244,16 @@ class GateRepository:
                             ).order_by(GateEvent.timestamp.asc())).all()
                             for cand in candidates:
                                 c1, c2 = cand.container_number or '', cand.container_number_2 or ''
-                                if ((len(c1) == 11 and c1[4:] == suffix) or
-                                        (len(c2) == 11 and c2[4:] == suffix)):
+                                if suffix and ((len(c1) == 11 and c1[4:] == suffix) or (len(c2) == 11 and c2[4:] == suffix)):
                                     existing = cand
+                                    break
+                                # Fuzzy dwell matching: same prefix and >= 70% OCR similarity
+                                for c in (c1, c2):
+                                    if c and len(c) >= 10 and len(number) >= 10:
+                                        if (number[:3] == c[:3] and ocr_similarity_score(number, c) >= 0.70):
+                                            existing = cand
+                                            break
+                                if existing:
                                     break
 
                     # Visual and capture-timestamp deduplication:
@@ -395,6 +405,9 @@ class GateRepository:
                         elif len(number) == 11 and number[4:].isdigit():
                             if (len(c1) == 11 and c1[4:] == number[4:]) or (len(c2) == 11 and c2[4:] == number[4:]):
                                 is_same_container = True
+                        elif ((c1 and len(c1) >= 10 and len(number) >= 10 and number[:3] == c1[:3] and ocr_similarity_score(number, c1) >= 0.70) or
+                              (c2 and len(c2) >= 10 and len(number) >= 10 and number[:3] == c2[:3] and ocr_similarity_score(number, c2) >= 0.70)):
+                            is_same_container = True
 
                     # Only reset existing = None if it is a new cleared passage of a DIFFERENT or UNIDENTIFIED vehicle
                     if not is_same_container:
@@ -1015,6 +1028,9 @@ class GateRepository:
                 # Distinct container numbers must NEVER be merged as duplicates by static camera background similarity.
                 if num and c_num and num != c_num:
                     ocr_sim = ocr_similarity_score(num, c_num)
+                    same_dwell_vehicle = (len(num) >= 10 and len(c_num) >= 10 and num[:3] == c_num[:3] and ocr_sim >= 0.70)
+                    if same_dwell_vehicle:
+                        return cand.id if cand.timestamp <= event.timestamp else cand.id
                     if not (time_diff <= 15.0 and ocr_sim >= 0.70):
                         continue
 
