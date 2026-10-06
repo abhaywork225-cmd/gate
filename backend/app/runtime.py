@@ -562,7 +562,7 @@ class GateRuntime:
             infer_thread = threading.Thread(target=self._inference_loop, name='gate-inference', daemon=True)
             self._threads.append(infer_thread)
             infer_thread.start()
-            for idx in (1, 2):
+            for idx in (1,):
                 ocr_thread = threading.Thread(target=self._ocr_loop, name=f'gate-ocr-{idx}', daemon=True)
                 self._threads.append(ocr_thread)
                 ocr_thread.start()
@@ -611,7 +611,7 @@ class GateRuntime:
         with self._accelerator:
             started = time.monotonic()
             detections = self.detector.detect(frame)
-            if camera.lanes and hasattr(self.detector, 'detect_vehicles'):
+            if (camera.lanes or 'truck' in self.settings.target_classes) and hasattr(self.detector, 'detect_vehicles'):
                 detections += self.detector.detect_vehicles(frame)
             self.metrics.latency('inference', time.monotonic() - started)
         self.metrics.inference(camera.id)
@@ -835,6 +835,13 @@ class GateRuntime:
                     self.passages.passages.pop(p.id, None)
                     self.ocr_store.link_passage(p.id, passage.id)
 
+    def _read_ocr(self, crop, is_iso=False):
+        with self._accelerator:
+            if is_iso:
+                iso_reader = getattr(self.ocr, 'read_iso', self.ocr.read)
+                return iso_reader(crop)
+            return self.ocr.read(crop)
+
     def _process_saved_ocr(self, job_id):
         job, crop, validation = self.ocr_store.load(job_id)
         if job.passage_id and job.passage_id not in self.passages.passages:
@@ -928,13 +935,13 @@ class GateRuntime:
                     x2 = min(img_w, int(d.bbox[2]) + pad)
                     sub_crop = job.frame.image[y1:y2, x1:x2]
                     if sub_crop.size > 0:
-                        sub_r = self.ocr.read(sub_crop)
+                        sub_r = self._read_ocr(sub_crop)
                         sub_v = self.validator.validate(sub_r)
                         if not sub_v.valid_check_digit and (sub_crop.shape[0] >= 1.2 * sub_crop.shape[1] or not sub_r.raw_text.strip()):
                             import cv2
                             for rot_code in (cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_90_CLOCKWISE):
                                 rot_crop = cv2.rotate(sub_crop, rot_code)
-                                rot_r = self.ocr.read(rot_crop)
+                                rot_r = self._read_ocr(rot_crop)
                                 rot_v = self.validator.validate(rot_r)
                                 if rot_v.valid_check_digit or (not sub_v.valid_check_digit and rot_v.confidence > sub_v.confidence and len(rot_v.normalized_text) >= 4):
                                     sub_r, sub_v = rot_r, rot_v
@@ -956,8 +963,7 @@ class GateRuntime:
                         fx2 = min(img_w, int(fd.bbox[2]) + pad)
                         f_crop = job.frame.image[fy1:fy2, fx1:fx2]
                         if f_crop.size > 0:
-                            iso_reader = getattr(self.ocr, 'read_iso', self.ocr.read)
-                            f_r = iso_reader(f_crop)
+                            f_r = self._read_ocr(f_crop, is_iso=True)
                             iso_c, human_s = extract_iso_size_code(f_r.raw_text)
                             if iso_c:
                                 if validation:
@@ -988,7 +994,7 @@ class GateRuntime:
                         x2 = min(img_w, int(d.bbox[2]) + pad)
                         sub_crop = job.frame.image[y1:y2, x1:x2]
                         if sub_crop.size > 0:
-                            sub_r = self.ocr.read(sub_crop)
+                            sub_r = self._read_ocr(sub_crop)
                             sub_v = self.validator.validate(sub_r)
                             if sub_v.valid_check_digit:
                                 read = sub_r
@@ -998,7 +1004,7 @@ class GateRuntime:
             # 2. FALLBACK TO MAIN CONTAINER CROP:
             # Only if targeted sub-boxes were missing or failed to produce a valid check digit.
             if validation is None or not validation.valid_check_digit:
-                main_read = self.ocr.read(crop)
+                main_read = self._read_ocr(crop)
                 main_val = self.validator.validate(main_read)
                 if validation is None or main_val.valid_check_digit or main_val.confidence > validation.confidence:
                     if validation and validation.size_type and main_val.valid_check_digit:
@@ -1020,7 +1026,7 @@ class GateRuntime:
                 companion_dict = dict(getattr(job, 'companion_frames', {}) or {})
                 for other_cam_id, comp_img in companion_dict.items():
                     if comp_img is not None and getattr(comp_img, 'size', 0) > 0:
-                        comp_read = self.ocr.read(comp_img)
+                        comp_read = self._read_ocr(comp_img)
                         comp_val = self.validator.validate(comp_read)
                         if comp_val.valid_check_digit or (validation is None or comp_val.confidence > validation.confidence):
                             read = comp_read

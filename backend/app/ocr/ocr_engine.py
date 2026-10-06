@@ -260,8 +260,13 @@ class EasyOCREngine:
                                      model_storage_directory=str(settings.ocr_model_directory),
                                      user_network_directory=str(network_dir),
                                      download_enabled=settings.ocr_download_enabled, verbose=False)
+        self._lock = threading.Lock()
 
     def read(self, image) -> OCRRead:
+        with self._lock:
+            return self._do_read(image)
+
+    def _do_read(self, image) -> OCRRead:
         import re
         import cv2
         from app.ocr.validator import CANDIDATE, STRUCTURE

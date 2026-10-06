@@ -18,7 +18,13 @@ class YoloDetector:
     def detect_vehicles(self, frame):
         """Local auxiliary truck model for calibrated multi-lane views only."""
         if self.vehicle_model is None:
-            path = self.settings.passage_vehicle_model_path
+            from pathlib import Path
+            path = Path(self.settings.passage_vehicle_model_path)
+            if not path.is_file():
+                for alt in (Path('models/yolov8n.pt'), Path('backend/models/yolov8n.pt')):
+                    if alt.is_file():
+                        path = alt
+                        break
             if not path.is_file():
                 return []  # No implicit model downloads on the edge device.
             from ultralytics import YOLO
@@ -58,11 +64,11 @@ class YoloDetector:
             for box in result.boxes:
                 raw_name = str(result.names[int(box.cls.item())]).lower()
                 name = self.settings.class_aliases.get(raw_name, raw_name)
-                if name == 'container_object':
+                if name in ('class0', '0', 'container_object'):
                     name = 'container'
-                elif name == 'cointainer':
+                elif name in ('class1', '1', 'cointainer'):
                     name = 'container_number'
-                elif name == 'feet':
+                elif name in ('class2', '2', 'feet'):
                     name = 'iso_code'
                 allowed = set(self.settings.target_classes) | {
                     'container', 'container_number', 'iso_code', 'truck', 'trailer', 'vehicle'
