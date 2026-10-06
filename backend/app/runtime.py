@@ -608,6 +608,12 @@ class GateRuntime:
             self._stop.wait(.005)
 
     def process_frame(self, camera, frame):
+        # A missing or failed detector must never produce lane events from
+        # camera metadata alone.  The lane-in/lane-out labels are configuration
+        # only; event creation requires real model detections.
+        if self.detector is None or self.model_status.get('detector') != 'READY':
+            self.metrics.increment('inference_skipped_model_unavailable')
+            return
         with self._accelerator:
             started = time.monotonic()
             detections = self.detector.detect(frame)
