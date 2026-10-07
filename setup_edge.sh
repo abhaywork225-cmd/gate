@@ -15,6 +15,12 @@ note() { echo; echo "==> $*"; }
 [[ "$(uname -s)" == "Linux" ]] || die "This script is for Ubuntu/Linux only."
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "python3 is required."
 command -v apt-get >/dev/null 2>&1 || die "apt-get is required on the edge device."
+"$PYTHON_BIN" - <<'PY' || { echo "ERROR: Python 3.11+ is required for GateVision." >&2; exit 1; }
+import sys
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+print(f"Python {sys.version_info.major}.{sys.version_info.minor} detected")
+PY
 
 if [[ ! -f /etc/nv_tegra_release ]]; then
   echo "WARNING: /etc/nv_tegra_release was not found. Continuing as generic Ubuntu."

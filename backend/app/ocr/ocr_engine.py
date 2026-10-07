@@ -239,14 +239,14 @@ def _extract_text_from_items(items):
         col_text = ''.join(str(it[1]) for it in chars)
         if STRUCTURE.search(col_text) or CANDIDATE.search(col_text) or SIX_PREFIX.search(col_text):
             combined = ' '.join(str(it[1]) for it in chars)
-            min_conf = float(min(it[2] for it in chars)) if chars else 0.0
-            return correct_feet_size_codes(combined)[:4096], min_conf
+            mean_conf = float(sum(it[2] for it in chars) / len(chars)) if chars else 0.0
+            return correct_feet_size_codes(combined)[:4096], mean_conf
 
     # Standard horizontal reading order
     h_items = sorted(items, key=lambda it: (it[0][0][1] // 30, it[0][0][0]))
     combined = ' '.join(str(it[1]) for it in h_items)
-    min_conf = float(min(it[2] for it in h_items)) if h_items else 0.0
-    return correct_feet_size_codes(combined)[:4096], min_conf
+    mean_conf = float(sum(it[2] for it in h_items) / len(h_items)) if h_items else 0.0
+    return correct_feet_size_codes(combined)[:4096], mean_conf
 
 
 class EasyOCREngine:

@@ -695,6 +695,7 @@ class CloudOutboxDispatcher:
                         conf_1 = float(getattr(obs.ocr, 'confidence', 0.95)) if (obs and obs.ocr and obs.ocr.confidence) else 0.95
                         containers_list.append({
                             'ContainerNumber': cntr1,
+                            'DetectionConfidence': round(float(getattr(obs.detection, 'confidence', 0.0)), 2),
                             'ContainerNumberConfidence': round(conf_1, 2),
                             'Size': size_1,
                             'ContainerSize': cs1 or None,
@@ -783,6 +784,7 @@ class CloudOutboxDispatcher:
                     if not containers_list and obs and obs.ocr and obs.ocr.normalized_text:
                         containers_list.append({
                             'ContainerNumber': obs.ocr.normalized_text,
+                            'DetectionConfidence': round(float(getattr(obs.detection, 'confidence', 0.0)), 2),
                             'ContainerNumberConfidence': round(float(obs.ocr.confidence), 2),
                             'Size': '20',
                             'Position': 'FRONT',

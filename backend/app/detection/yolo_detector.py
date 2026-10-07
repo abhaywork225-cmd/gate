@@ -82,5 +82,12 @@ class YoloDetector:
                 x1, y1, x2, y2 = coords
                 bbox = (max(0., x1), max(0., y1), min(float(width), x2), min(float(height), y2))
                 if bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                    # Container IDs are printed as horizontal strips. Reject
+                    # vertical/sliver boxes (wall markings, side rails and OSD
+                    # text) before they reach OCR and become false IDs.
+                    if name == 'container_number':
+                        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                        if bw / max(bh, 1.0) < 0.40 or bw < 32.0:
+                            continue
                     detections.append(Detection(frame.camera_id, frame.timestamp, name, confidence, bbox))
         return detections

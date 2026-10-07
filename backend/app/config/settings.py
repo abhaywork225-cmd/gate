@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     min_track_hits: int = Field(default=3, ge=1)
     # One valid check-digit read is sufficient once a truck is stationary;
     # additional samples remain available for twin confirmation and review.
-    ocr_confirmations: int = Field(default=1, ge=1)
+    ocr_confirmations: int = Field(default=2, ge=1)
     ocr_max_attempts: int = Field(default=4, ge=1)
     ocr_interval_seconds: float = Field(default=.5, gt=0)
     ocr_queue_size: int = Field(default=8, ge=1, le=100)

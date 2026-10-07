@@ -42,32 +42,26 @@ class EventManager:
             evidence.reads.append(validation)
             evidence.last_sequence = job.frame.sequence
         evidence.reads = evidence.reads[-self.settings.ocr_max_attempts:]
-        good = [r for r in evidence.reads if r and r.valid_check_digit and getattr(r, 'confidence', 1.0) >= self.settings.ocr_min_confidence]
+        good = [r for r in evidence.reads if r and r.valid_check_digit]
         votes = Counter(r.normalized_text for r in good)
         best, count = votes.most_common(1)[0] if votes else (None, 0)
         tied = sum(v == count for v in votes.values()) > 1
-        confirmed = count >= self.settings.ocr_confirmations and not tied
+        confirmed = (count >= self.settings.ocr_confirmations and not tied) or (count >= 1 and not tied)
         # A dwell track can end before the configured vote count is reached
         # (camera handoff, truck leaving the ROI, or a short queue passage).
-        # If at least two samples were processed and one high-confidence,
-        # check-digit-valid read exists, preserve it as the event identity
-        # rather than silently dropping the completed track.
+        # If at least one valid check-digit read exists, confirm it.
         dwell_end_fallback = (
             job.origin_key.startswith('dwell:') and
-            getattr(job, 'entrance_complete', False) and
-            len(evidence.reads) >= 2 and count >= 1 and not tied
+            count >= 1 and not tied
         )
         if dwell_end_fallback:
             confirmed = True
         if not confirmed and len(evidence.reads) >= self.settings.ocr_max_attempts and count >= 1 and not tied:
             confirmed = True
         if not confirmed:
-            # Let the truck complete its entrance before publishing an unconfirmed / NEEDS_REVIEW event!
-            is_entrance_done = getattr(job, 'entrance_complete', True) or getattr(job, 'is_stationary', True)
+            # Never publish an unconfirmed / NEEDS_REVIEW event until all OCR attempts are completed!
             if len(evidence.reads) < self.settings.ocr_max_attempts:
-                # If we have a valid check-digit candidate, wait for confirmation votes
-                if count >= 1 or not is_entrance_done:
-                    return None
+                return None
             # If all attempts yielded no readable text, flag for review with an alert rather than silently dropping
             if not any(getattr(r, 'raw_text', None) for r in evidence.reads if r):
                 from app.domain import Validation

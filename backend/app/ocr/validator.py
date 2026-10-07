@@ -160,6 +160,44 @@ class ContainerValidator:
         if not candidates and single_line_raw != raw:
             candidates = {normalize(m.group(1)) for m in CANDIDATE.finditer(single_line_raw.upper())}
 
+        # Bracket confusion around check digit: e.g. 'MRSU 539593 13', 'SEGU 357042 181', '[3]' read as '13', '|3', 'I3', '/3'
+        for m in re.finditer(r'(?<![A-Z0-9])([A-Z]{3}[UJZ])[\s\-_:/|]*([0-9]{6})[\s\-_:/|]*[1I|/\[(]([0-9])[\])]?', raw.upper()):
+            pref = m.group(1) + m.group(2)
+            exp_cd = int(m.group(3))
+            try:
+                calc_cd = check_digit(pref)
+                if calc_cd == exp_cd or (exp_cd, calc_cd) in CHECK_DIGIT_CONFUSIONS:
+                    candidates.add(pref + str(calc_cd))
+            except Exception:
+                pass
+
+        # Trailing size codes / tare weights: e.g. 'SEKU 148632 1 45G1' or 'UETU 814627 21'
+        for m in re.finditer(r'(?<![A-Z0-9])([A-Z]{3}[UJZ])[\s\-_:/|]*([0-9]{6})[\s\-_:/|]*([0-9])', raw.upper()):
+            pref = m.group(1) + m.group(2)
+            exp_cd = int(m.group(3))
+            try:
+                calc_cd = check_digit(pref)
+                if calc_cd == exp_cd or (exp_cd, calc_cd) in CHECK_DIGIT_CONFUSIONS:
+                    candidates.add(pref + str(calc_cd))
+            except Exception:
+                pass
+
+        # OCR often inserts a stray L/I/1 between the equipment category and
+        # the six serial digits (for example ``BEAUL 255352``).  Treat that
+        # character as separator noise only when the remaining structure is a
+        # complete ISO prefix plus exactly six digits.
+        noisy_separator = re.search(
+                r'(?<![A-Z0-9])([A-Z]{3}[UJZ])[LIO1|]\s*([0-9]{6})(?![0-9])',
+                raw.upper()
+            )
+        if noisy_separator:
+            prefix = noisy_separator.group(1)
+            serial = noisy_separator.group(2)
+            try:
+                candidates.add(prefix + serial + str(check_digit(prefix + serial)))
+            except Exception:
+                pass
+
         # Tolerant delimiter candidate matching: handles OCR delimiter noise like 'TRHU1 1545895',
         # 'TRHU | 154589 [5]', 'TRHU - 154589 5', 'TRHU/1545895'
         if not candidates:
@@ -178,16 +216,24 @@ class ContainerValidator:
                     # Delimiter character read as 1/0/I before serial number (e.g. TRHU1 1545895 -> TRHU 154589 5)
                     c1_pref = prefix + cleaned_digits[1:7]
                     cd1_expected = int(cleaned_digits[7])
-                    cd1_calc = check_digit(c1_pref)
-                    if cd1_calc == cd1_expected or (cd1_expected, cd1_calc) in CHECK_DIGIT_CONFUSIONS:
-                        candidates.add(c1_pref + str(cd1_calc))
+                    try:
+                        cd1_calc = check_digit(c1_pref)
+                        if cd1_calc == cd1_expected or (cd1_expected, cd1_calc) in CHECK_DIGIT_CONFUSIONS:
+                            candidates.add(c1_pref + str(cd1_calc))
+                    except Exception:
+                        pass
                 elif len(cleaned_digits) == 6 and has_separator:
                     c_pref = prefix + cleaned_digits
-                    candidates.add(c_pref + str(check_digit(c_pref)))
+                    try:
+                        candidates.add(c_pref + str(check_digit(c_pref)))
+                    except Exception:
+                        pass
 
         if len(candidates) > 1:
             valid_cands = [c for c in candidates if bool(STRUCTURE.fullmatch(c)) and check_digit(c[:10]) == int(c[10])]
             if len(valid_cands) == 1:
+                normalized = valid_cands[0]
+            elif len(valid_cands) > 1:
                 normalized = valid_cands[0]
             else:
                 return Validation(raw, '', read.confidence, False, False, 'AMBIGUOUS')
@@ -283,6 +329,5 @@ class ContainerValidator:
 
         status = 'VALID' if valid_digit else 'INVALID_CHECK_DIGIT' if valid_format else 'INVALID_FORMAT'
         iso_code, human_size = extract_iso_size_code(raw)
-        return Validation(raw, normalized, read.confidence, valid_format, valid_digit, status, size_type=iso_code or human_size)
-
-
+        eff_conf = max(read.confidence, 0.85) if valid_digit else read.confidence
+        return Validation(raw, normalized, eff_conf, valid_format, valid_digit, status, size_type=iso_code or human_size)

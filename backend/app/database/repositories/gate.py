@@ -18,9 +18,11 @@ def serialize(record):
     if isinstance(record, GateEvent) and result.get('is_twin'):
         distinct_second = bool(result.get('container_number_2') and
                                result['container_number_2'] != result.get('container_number'))
-        if not distinct_second and str(result.get('iso_code_1') or '').startswith(('4', 'L')):
+        # A geometric twin candidate is not a confirmed twin.  Without two
+        # distinct validated container IDs, expose it as a single reviewable
+        # visit so cloud/UI consumers cannot publish a phantom second box.
+        if not distinct_second:
             result['is_twin'] = False
-        elif not distinct_second:
             result['status'] = 'NEEDS_REVIEW'
     return {key: value.isoformat() + 'Z' if isinstance(value, datetime) else value for key, value in result.items()}
 
@@ -166,6 +168,8 @@ class GateRepository:
                          same_container_window_seconds: float = 900):
         """One writer per service; DB uniqueness also protects retried track writes."""
         created_paths = []
+        if snapshots is not None and hasattr(snapshots, 'root'):
+            self.db.snapshot_directory = snapshots.root
         try:
             with self._write_lock, self.db.sessions.begin() as session:
                 prior = session.scalar(select(DetectionRecord).where(DetectionRecord.origin_key == obs.origin_key))
@@ -444,7 +448,8 @@ class GateRepository:
                 is_40ft = size_str.startswith('4') or '40' in size_str or '45' in size_str
                 obs_is_twin = getattr(obs, 'is_twin', False)
                 is_twin_event = (
-                    obs_is_twin or (existing and existing.is_twin) or is_rear_slot
+                    obs_is_twin or (existing and existing.is_twin) or is_rear_slot or
+                    (size_str.startswith('2') and not str(obs.origin_key).startswith('dwell:'))
                 ) and not is_40ft
                 if created:
                     assign_to_rear = is_twin_event and is_rear_slot
@@ -695,6 +700,21 @@ class GateRepository:
             result['ocr_results'] = [serialize(o) for o in session.scalars(select(OCRResult).where(
                 OCRResult.detection_id.in_([d.id for d in detections])))]
             snapshots_list = [serialize(s) for s in session.scalars(select(Snapshot).where(Snapshot.event_id == event_id))]
+            if not snapshots_list:
+                # Recover legacy/event files written before snapshot metadata
+                # was committed. This keeps API evidence available while the
+                # filesystem is reconciled into SQL during maintenance.
+                try:
+                    from pathlib import Path
+                    root = Path(self.db.snapshot_directory) if hasattr(self.db, 'snapshot_directory') else None
+                    if root and (root / str(event_id)).is_dir():
+                        for path in sorted((root / str(event_id)).glob('*.jpg')):
+                            snapshots_list.append({'id': path.stem, 'event_id': event_id,
+                                                   'camera_id': path.stem.split('_', 1)[0],
+                                                   'image_path': str(path.relative_to(root)).replace('\\', '/'),
+                                                   'timestamp': row.timestamp})
+                except Exception:
+                    pass
             # Select best primary (front) camera: Prefer front/top cameras, exclude rear cameras from primary
             best_front_cam = None
             best_front_score = -1.0
@@ -813,7 +833,16 @@ class GateRepository:
     def snapshot(self, snapshot_id):
         with self.db.sessions() as session:
             row = session.get(Snapshot, snapshot_id)
-            return serialize(row) if row else None
+            if row:
+                return serialize(row)
+            from pathlib import Path
+            root = getattr(self.db, 'snapshot_directory', None)
+            if root:
+                for path in Path(root).rglob(f'{snapshot_id}.jpg'):
+                    return {'id': snapshot_id, 'event_id': path.parent.name,
+                            'camera_id': path.stem.split('_', 1)[0],
+                            'image_path': str(path.relative_to(root)).replace('\\', '/')}
+            return None
 
     def mark_cloud_synced(self, event_id: str, cloud_event_id: str | None = None):
         with self.db.sessions.begin() as session:

@@ -108,15 +108,16 @@ class ViewOccupancy:
     def update(self, camera, frame, detections):
         now = frame.timestamp
         dwell_classes = getattr(self.settings, 'dwell_container_classes', None) or ['container', 'container_number', 'iso_code']
+        min_conf = getattr(self.settings, 'confidence_threshold', 0.35)
         all_boxes = [(d, normalized(d.bbox, frame.image.shape)) for d in detections
-                     if d.class_name in dwell_classes]
+                     if d.class_name in dwell_classes and d.confidence >= min_conf]
         zone = camera.occupancy_roi
         # A configured crossing line is not proof of departure in a congested
         # gate: a truck can creep across it and reverse. Retain the visit while
         # any eligible container evidence is still visible in the lane ROI.
         visible_in_zone = any(
             iou(b, zone) > 0 and box_area(b) >=
-            (0.005 if d.class_name == 'container' else 0.0001)
+            (0.015 if d.class_name == 'container' else 0.0008)
             for d, b in all_boxes
         )
 
@@ -125,7 +126,7 @@ class ViewOccupancy:
         for d, b in all_boxes:
             cx, cy = center(b)
             if iou(b, zone) > 0 and (zone[0] <= cx <= zone[2] and zone[1] <= cy <= zone[3]) and not self._past_exit(b, camera):
-                min_area = 0.005 if d.class_name == 'container' else 0.0001
+                min_area = 0.015 if d.class_name == 'container' else 0.0008
                 if box_area(b) >= min_area:
                     raw_candidates.append((d, b))
 
@@ -140,6 +141,20 @@ class ViewOccupancy:
             self.current = state = None  # Explicit source/calibration generation change.
 
         if state:
+            # A queued vehicle can arrive before the previous one produces a
+            # full clear interval. If a single stationary visit is followed by
+            # a clearly separate detection, hand off to a fresh occupancy
+            # origin instead of attaching the new vehicle to the old event.
+            if state.stationary and not state.is_twin and state.bbox and candidates:
+                front_candidate = max(candidates, key=lambda item: box_area(item[1]))
+                candidate_box = front_candidate[1]
+                separate = iou(state.bbox, candidate_box) < 0.10
+                axis = 1 if camera.gate_exit_axis == 'y' else 0
+                distance = abs(center(state.bbox)[axis] - center(candidate_box)[axis])
+                eligible = front_candidate[0].class_name in ('container', 'container_number', 'iso_code')
+                if eligible and separate and distance >= 0.25:
+                    self.current = None
+                    return self.update(camera, frame, detections)
             gap = (now - state.last_measured).total_seconds()
             if gap <= 0:
                 return None  # Duplicate/backwards timestamps cannot advance clearance.

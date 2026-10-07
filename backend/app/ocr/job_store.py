@@ -171,8 +171,10 @@ class OCRJobStore:
     def save(self, job, crop):
         import cv2
         def encode_img(image, crop_image=False):
-            extension = '.png' if crop_image else '.jpg'
-            options = [cv2.IMWRITE_PNG_COMPRESSION, 1] if crop_image else [cv2.IMWRITE_JPEG_QUALITY, 88]
+            # Preserve full-frame proof pixels exactly; JPEG recompression can
+            # replace the sharp accepted frame during cleanup/retry checks.
+            extension = '.png'
+            options = [cv2.IMWRITE_PNG_COMPRESSION, 1]
             ok, data = cv2.imencode(extension, image, options)
             if not ok:
                 raise OSError('OCR evidence encoding failed')
@@ -229,7 +231,7 @@ class OCRJobStore:
             if existing:
                 return existing['id']
             if self.shared_evidence:
-                paths = f'{folder}/{prefix}_crop.png', f'{folder}/{prefix}_frame.jpg'
+                paths = f'{folder}/{prefix}_crop.png', f'{folder}/{prefix}_frame.png'
                 self._write_image(paths[0], crop_data)
                 self._write_image(paths[1], image_data)
             else:

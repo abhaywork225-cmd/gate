@@ -1,6 +1,19 @@
 from __future__ import annotations
 import math
 
+def prepare_ocr_crop(image):
+    """Upscale and improve contrast for small/angled container markings."""
+    import cv2
+    if image is None or getattr(image, 'size', 0) == 0:
+        return image
+    h, w = image.shape[:2]
+    scale = 3.0 if min(h, w) < 160 else 2.0
+    enlarged = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    lab = cv2.cvtColor(enlarged, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
 
 def crop_identification(image, bbox, roi=(0, 0, 1, 1)):
     height, width = image.shape[:2]

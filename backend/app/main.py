@@ -40,6 +40,9 @@ def create_app(settings=None, database=None, camera_configs=None, runtime_factor
         sources = camera_sources if camera_sources is not None else settings.camera_sources(configs)
         repository = GateRepository(db)
         snapshots = SnapshotManager(settings.snapshot_directory)
+        # Expose the evidence root for legacy filesystem-only snapshot
+        # recovery in the repository/API layer.
+        db.snapshot_directory = snapshots.root
         runtime = runtime_factory(settings, configs, repository, snapshots, camera_sources=sources)
         app.state.database, app.state.repository = db, repository
         app.state.snapshots, app.state.runtime = snapshots, runtime

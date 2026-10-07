@@ -27,7 +27,7 @@ from app.events.gate_logic import update_direction
 from app.events.occupancy import ViewOccupancy
 from app.events.passages import PassageCollector
 from app.metrics import Metrics
-from app.ocr.container_ocr import crop_identification
+from app.ocr.container_ocr import crop_identification, prepare_ocr_crop
 from app.ocr.ocr_engine import EasyOCREngine, create_ocr_engine
 from app.ocr.validator import ContainerValidator, extract_iso_size_code
 from app.ocr.job_store import OCRJobStore
@@ -842,11 +842,14 @@ class GateRuntime:
                     self.ocr_store.link_passage(p.id, passage.id)
 
     def _read_ocr(self, crop, is_iso=False):
-        with self._accelerator:
-            if is_iso:
-                iso_reader = getattr(self.ocr, 'read_iso', self.ocr.read)
-                return iso_reader(crop)
-            return self.ocr.read(crop)
+        # OCR must not hold the YOLO/TensorRT accelerator lock.  A slow OCR
+        # read otherwise starves live camera inference and lets trucks pass
+        # between detector frames. The OCR engine owns its own thread safety.
+        crop = prepare_ocr_crop(crop)
+        if is_iso:
+            iso_reader = getattr(self.ocr, 'read_iso', self.ocr.read)
+            return iso_reader(crop)
+        return self.ocr.read(crop)
 
     def _process_saved_ocr(self, job_id):
         job, crop, validation = self.ocr_store.load(job_id)
@@ -1028,7 +1031,7 @@ class GateRuntime:
 
             # 3. FALLBACK TO COMPANION CAMERA FRAMES (e.g. Side or Rear cameras):
             # If the primary camera didn't yield a valid container check digit, attempt OCR on companion camera frames
-            if (validation is None or not validation.valid_check_digit) and not targeted_text_seen:
+            if validation is None or not validation.valid_check_digit:
                 companion_dict = dict(getattr(job, 'companion_frames', {}) or {})
                 for other_cam_id, comp_img in companion_dict.items():
                     if comp_img is not None and getattr(comp_img, 'size', 0) > 0:
