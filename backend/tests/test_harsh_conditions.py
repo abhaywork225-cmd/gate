@@ -25,13 +25,13 @@ def _frame(camera, second=0, value=0, source="harsh"):
     return Frame(camera, ts, second + 1, image, source)
 
 
-def _valid(text="MSCU1234567", size="22G1"):
+def _valid(text="CSQU3054383", size="22G1"):
     return Validation(text, text, .99, True, True, "VALID", size_type=size)
 
 
 @pytest.fixture
 def mock_settings(settings):
-    return settings.model_copy(update={"prosper_enabled": True, "prosper_site_id": "site-test"})
+    return settings.model_copy(update={"prosper_enabled": True, "prosper_auto_dispatch": True, "prosper_site_id": "site-test"})
 
 
 def _job(make_job, sequence, origin, camera="camera-1", timestamp=None):
@@ -58,7 +58,7 @@ def test_invalid_partial_read_never_becomes_a_twin(repository, snapshots, camera
     repository.save_observation(late_obs, snapshots, 30, ongoing_event_id=event_id)
 
     event = repository.event(event_id)
-    assert event["container_number"] == "MSCU1234567"
+    assert event["container_number"] == "CSQU3054383"
     assert event["container_number_2"] is None
     assert event["is_twin"] is False
 
@@ -84,21 +84,21 @@ def test_two_valid_cameras_merge_into_one_event(repository, snapshots, camera, m
     repository.sync_cameras([camera, camera.model_copy(update={"id": "camera-2", "source_env": "CAM2"})])
     a = _job(make_job, 1, "dwell:camera-1:front", "camera-1")
     a = replace(a, detection=Detection("camera-1", a.frame.timestamp, "container", .97, (10, 10, 140, 220)))
-    obs_a = Observation(a.origin_key, camera.gate_id, 1, a.detection, _valid("MSCU1234567"), "EXIT",
+    obs_a = Observation(a.origin_key, camera.gate_id, 1, a.detection, _valid("CSQU3054383"), "EXIT",
                         a.frame.image, a.frame.timestamp, True, slot_position="FRONT")
     event_id, created = repository.save_observation(obs_a, snapshots, 30)
     assert created
 
     b = _job(make_job, 2, "dwell:camera-2:rear", "camera-2", a.frame.timestamp + timedelta(seconds=3))
     b = replace(b, detection=Detection("camera-2", b.frame.timestamp, "container", .96, (20, 20, 150, 220)))
-    obs_b = Observation(b.origin_key, camera.gate_id, 2, b.detection, _valid("TGHU7654321"), "EXIT",
+    obs_b = Observation(b.origin_key, camera.gate_id, 2, b.detection, _valid("MSCU6639870"), "EXIT",
                         b.frame.image, b.frame.timestamp, True, slot_position="REAR")
     merged, created_second = repository.save_observation(obs_b, snapshots, 30, ongoing_event_id=event_id)
     assert merged == event_id
     assert not created_second
     event = repository.event(event_id)
     assert event["is_twin"] is True
-    assert {event["container_number"], event["container_number_2"]} == {"MSCU1234567", "TGHU7654321"}
+    assert {event["container_number"], event["container_number_2"]} == {"CSQU3054383", "MSCU6639870"}
 
 
 def test_blank_proof_is_replaced_with_safe_fallback(mock_settings):

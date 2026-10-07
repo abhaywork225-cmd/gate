@@ -1,6 +1,6 @@
-import { Component, input, output, signal } from '@angular/core';
+import { Component, inject, input, output, signal } from '@angular/core';
 import { DatePipe, PercentPipe } from '@angular/common';
-import { EventDetail } from './gate-api.service';
+import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
 
 @Component({
   selector: 'gate-event-detail',
@@ -76,7 +76,7 @@ import { EventDetail } from './gate-api.service';
               </div>
             } @else {
               <h1 class="hero-container-title">
-                <span class="container-badge mono">{{ item.container_number || 'UNCONFIRMED / REVIEW NEEDED' }}</span>
+                <span class="container-badge mono">{{ item.container_number || item.candidate_number || 'NUMBER NOT READ' }}</span>
                 <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="item.status !== 'CONFIRMED'">
                   {{ item.status.replaceAll('_', ' ') }}
                 </span>
@@ -101,6 +101,61 @@ import { EventDetail } from './gate-api.service';
             }
           </div>
         </div>
+
+        @if (item.review_reason) {
+          <p class="review-explanation">{{ item.review_reason }}</p>
+        }
+        @if (!item.container_number && item.candidate_number) {
+          <p>This OCR number is unverified and has not been sent to cloud.</p>
+        }
+
+        <!-- Cloud Dispatch Review & Action Banner -->
+        <div class="cloud-dispatch-banner" [class.synced]="item.cloud_synced" [class.paused]="!item.cloud_synced">
+          <div class="cloud-banner-left">
+            @if (item.cloud_synced) {
+              <div class="cloud-status-badge synced">
+                <span class="badge-icon">✓</span>
+                <span>SENT TO SITE</span>
+              </div>
+              <div class="cloud-banner-text">
+                <strong>Event published to Prosper Smart Yard cloud site</strong>
+                @if (item.cloud_event_id) {
+                  <span class="cloud-id mono">Cloud ID: {{ item.cloud_event_id }}</span>
+                }
+                @if (item.cloud_synced_at) {
+                  <span class="cloud-synced-time">Synced: {{ item.cloud_synced_at | date:'HH:mm:ss · dd MMM' }}</span>
+                }
+              </div>
+            } @else {
+              <div class="cloud-status-badge paused">
+                <span class="badge-icon">⏸</span>
+                <span>DISPATCH PAUSED (AWAITING YOUR REVIEW)</span>
+              </div>
+              <div class="cloud-banner-text">
+                <strong>Local UI Review Mode Active:</strong>
+                <span>Automatic sending to site is paused. Review all container numbers and camera captures below. When satisfied, click "Send to Site".</span>
+              </div>
+            }
+          </div>
+          <div class="cloud-banner-right">
+            <button class="send-to-site-btn" [class.resend]="item.cloud_synced" [disabled]="dispatching()" (click)="dispatchToSite(item)">
+              @if (dispatching()) {
+                <span class="spinner">⏳</span> Sending to Site...
+              } @else if (item.cloud_synced) {
+                <span>🔄 Re-send to Site</span>
+              } @else {
+                <span>📤 Send to Site</span>
+              }
+            </button>
+          </div>
+        </div>
+
+        @if (dispatchMessage()) {
+          <div class="dispatch-message-bar" [class.success]="dispatchSuccess()" [class.error]="!dispatchSuccess()">
+            <span>{{ dispatchMessage() }}</span>
+            <button class="close-msg-btn" (click)="clearDispatchMessage()">✕</button>
+          </div>
+        }
 
         @if (showJson()) {
           <div class="json-viewer-panel">
@@ -201,6 +256,13 @@ import { EventDetail } from './gate-api.service';
                         <span class="proof-badge">FRONT (SLOT 1): <strong class="mono">{{ item.container_number || 'PENDING OCR' }}</strong></span>
                         <span class="proof-cam mono">{{ frontSnap.camera_id }}</span>
                       </div>
+                      @if (getCropForContainer(item, 1); as crop1) {
+                        <div class="ocr-crop-strip">
+                          <span class="crop-tag">NUMBER CROP</span>
+                          <img [src]="'/api/ocr-crops/' + crop1.id" alt="Front container number crop" class="crop-thumbnail">
+                          <span class="crop-text mono">{{ crop1.normalized_text || item.container_number }}</span>
+                        </div>
+                      }
                       <div class="proof-img-wrap">
                         <img [src]="snapshotUrl(frontSnap.id)" [alt]="'Front container proof from ' + frontSnap.camera_id" (error)="markImageError(frontSnap.id)">
                       </div>
@@ -218,6 +280,13 @@ import { EventDetail } from './gate-api.service';
                         <span class="proof-badge">REAR (SLOT 2): <strong class="mono">{{ item.container_number_2 || 'PENDING OCR' }}</strong></span>
                         <span class="proof-cam mono">{{ rearSnap.camera_id }}</span>
                       </div>
+                      @if (getCropForContainer(item, 2); as crop2) {
+                        <div class="ocr-crop-strip">
+                          <span class="crop-tag">NUMBER CROP</span>
+                          <img [src]="'/api/ocr-crops/' + crop2.id" alt="Rear container number crop" class="crop-thumbnail">
+                          <span class="crop-text mono">{{ crop2.normalized_text || item.container_number_2 }}</span>
+                        </div>
+                      }
                       <div class="proof-img-wrap">
                         <img [src]="snapshotUrl(rearSnap.id)" [alt]="'Rear container proof from ' + rearSnap.camera_id" (error)="markImageError(rearSnap.id)">
                       </div>
@@ -232,9 +301,16 @@ import { EventDetail } from './gate-api.service';
                 @if (getPrimarySnapshot(item); as primary) {
                   <div class="primary-proof-card">
                     <div class="proof-header">
-                      <span class="proof-badge">PRIMARY CONTAINER PROOF</span>
+                      <span class="proof-badge">PRIMARY CONTAINER PROOF: <strong class="mono">{{ item.container_number || 'PENDING OCR' }}</strong></span>
                       <span class="proof-cam mono">{{ primary.camera_id }}</span>
                     </div>
+                    @if (getCropForContainer(item, 1); as cropSingle) {
+                      <div class="ocr-crop-strip">
+                        <span class="crop-tag">NUMBER CROP</span>
+                        <img [src]="'/api/ocr-crops/' + cropSingle.id" alt="Container number crop" class="crop-thumbnail">
+                        <span class="crop-text mono">{{ cropSingle.normalized_text || item.container_number }}</span>
+                      </div>
+                    }
                     <div class="proof-img-wrap">
                       <img [src]="snapshotUrl(primary.id)" [alt]="'Container proof from ' + primary.camera_id" (error)="markImageError(primary.id)">
                     </div>
@@ -290,6 +366,8 @@ import { EventDetail } from './gate-api.service';
   `
 })
 export class EventDetailComponent {
+  private gateApi = inject(GateApi);
+
   event = input<EventDetail | null>(null);
   back = output<void>();
   showJson = signal(false);
@@ -297,16 +375,17 @@ export class EventDetailComponent {
   imageLoaded = signal<Record<string, boolean>>({});
   imageErrors = signal<Record<string, boolean>>({});
 
+  dispatching = signal(false);
+  dispatchSuccess = signal(false);
+  dispatchMessage = signal<string | null>(null);
+
   snapshotUrl(id: string): string {
-    // Derived proof includes the observed number crop and the raw OCR reading.
-    // Full-resolution links retain the unmodified capture.
     return `/api/snapshots/${id}?proof=true`;
   }
 
   rawSnapshotUrl(id: string): string {
     return `/api/snapshots/${encodeURIComponent(id)}`;
   }
-
 
   markImageLoaded(id: string) {
     this.imageLoaded.update(state => ({ ...state, [id]: true }));
@@ -318,6 +397,47 @@ export class EventDetailComponent {
 
   toggleJson() {
     this.showJson.update(v => !v);
+  }
+
+  dispatchToSite(item: EventDetail) {
+    if (!item?.id || this.dispatching()) return;
+    this.dispatching.set(true);
+    this.dispatchMessage.set(null);
+
+    this.gateApi.dispatchCloud(item.id).subscribe({
+      next: (res) => {
+        this.dispatching.set(false);
+        this.dispatchSuccess.set(true);
+        this.dispatchMessage.set(res.message || '✓ Event successfully dispatched to cloud site!');
+        item.cloud_synced = true;
+        if (res.cloud_event_id) {
+          item.cloud_event_id = res.cloud_event_id;
+        }
+      },
+      error: (err) => {
+        this.dispatching.set(false);
+        this.dispatchSuccess.set(false);
+        const detail = err?.error?.detail || err?.error?.message || err?.message || 'Failed to dispatch event to site';
+        this.dispatchMessage.set('⚠ Error: ' + detail);
+      }
+    });
+  }
+
+  clearDispatchMessage() {
+    this.dispatchMessage.set(null);
+  }
+
+  getCropForContainer(item: EventDetail, slot: 1 | 2): OcrCrop | null {
+    if (!item?.ocr_crops?.length) return null;
+    const targetNumber = slot === 1 ? item.container_number : item.container_number_2;
+    if (targetNumber) {
+      const match = item.ocr_crops.find(c => c.normalized_text === targetNumber);
+      if (match) return match;
+    }
+    const slotStr = slot === 1 ? 'FRONT' : 'REAR';
+    const slotMatch = item.ocr_crops.find(c => c.slot_position?.toUpperCase() === slotStr);
+    if (slotMatch) return slotMatch;
+    return slot === 1 ? item.ocr_crops[0] : (item.ocr_crops.length > 1 ? item.ocr_crops[1] : null);
   }
 
   getPrimarySnapshot(item: EventDetail) {
@@ -347,7 +467,9 @@ export class EventDetailComponent {
     }
     const rear = item.snapshots.find(s => s.image_path?.endsWith('_rear.jpg'));
     if (rear) return rear;
-    return item.snapshots.length > 1 ? item.snapshots[1] : null;
+    const frontSnap = this.getFrontSnapshot(item);
+    const diff = item.snapshots.find(s => s.id !== frontSnap?.id);
+    return diff || (item.snapshots.length > 1 ? item.snapshots[1] : null);
   }
 
   hasFeetDetection(item: EventDetail | null): boolean {

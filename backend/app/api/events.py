@@ -24,7 +24,22 @@ def event(event_id: str, request: Request):
         result, min_quality=getattr(request.app.state.runtime.settings, 'cloud_min_proof_quality', 2.5)
     )
     result['snapshots'] = result['evidence_manifest']['captures']
+    result['primary_snapshot_id'] = result['evidence_manifest']['primary_snapshot_id']
+    result['rear_snapshot_id'] = result['evidence_manifest']['rear_snapshot_id']
     result['ocr_crops'] = request.app.state.runtime.ocr_store.event_crops(event_id)
+    dispatcher = getattr(request.app.state.runtime, 'dispatcher', None)
+    result['cloud_auto_dispatch'] = getattr(dispatcher, 'auto_dispatch', False) if dispatcher else False
+    return result
+
+
+@router.post('/gate-events/{event_id}/dispatch-cloud')
+def dispatch_cloud_event(event_id: str, request: Request):
+    runtime = request.app.state.runtime
+    if not hasattr(runtime, 'dispatcher') or not runtime.dispatcher:
+        raise HTTPException(503, 'Cloud dispatcher is not initialized')
+    result = runtime.dispatcher.dispatch_event(event_id)
+    if not result.get('success'):
+        raise HTTPException(400, detail=result.get('error', 'Cloud dispatch failed'))
     return result
 
 

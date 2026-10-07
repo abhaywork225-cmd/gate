@@ -62,6 +62,44 @@ def _within_capture_window(left: Any, right: Any, seconds: float = 3.0) -> bool:
         return False
 
 
+def verified_cloud_identity(event, observation, number, minimum):
+    from app.domain import OCRRead
+    from app.ocr.validator import ContainerValidator
+    sources = [(o.get('raw_text', ''), o.get('confidence', 0))
+               for o in (event or {}).get('ocr_results', [])]
+    ocr = getattr(observation, 'ocr', None)
+    if ocr:
+        sources.append((ocr.raw_text, ocr.confidence))
+    for raw, confidence in sources:
+        value = ContainerValidator().validate(OCRRead(raw, float(confidence or 0)))
+        if value.valid_check_digit and value.normalized_text == number and value.confidence >= minimum:
+            return True
+    return False
+
+
+def identity_confidence(event, observation, number):
+    """Use the actual reading for this identity, including outbox restarts."""
+    readings = [o for o in (event or {}).get('ocr_results', [])
+                if o.get('valid_check_digit') and o.get('normalized_text') == number]
+    scores = [float(o.get('confidence') or 0) for o in readings]
+    ocr = getattr(observation, 'ocr', None)
+    if ocr and ocr.normalized_text == number:
+        scores.append(float(ocr.confidence or 0))
+    return max(scores, default=0.0)
+
+
+def detection_confidence(event, observation, number):
+    ids = {o.get('detection_id') for o in (event or {}).get('ocr_results', [])
+           if o.get('normalized_text') == number and o.get('valid_check_digit')}
+    scores = [float(d.get('confidence') or 0) for d in (event or {}).get('detections', [])
+              if d.get('id') in ids]
+    ocr = getattr(observation, 'ocr', None)
+    det = getattr(observation, 'detection', None)
+    if det and ocr and ocr.normalized_text == number:
+        scores.append(float(det.confidence or 0))
+    return max(scores, default=0.0)
+
+
 class ProsperSession:
     """Manages authentication tokens and HTTP requests to Prosper Smart Yard."""
 
@@ -324,6 +362,7 @@ class CloudOutboxDispatcher:
         self.snapshots = snapshots
         self.runtime = runtime
         self.enabled = bool(settings.prosper_enabled)
+        self.auto_dispatch: bool = bool(getattr(settings, 'prosper_auto_dispatch', False))
         self.session = ProsperSession(settings) if self.enabled else None
         self.queue: Queue = Queue(maxsize=settings.prosper_queue_size)
         self._stop = threading.Event()
@@ -338,6 +377,20 @@ class CloudOutboxDispatcher:
             or 'EDGE-GATE-01'
         )
 
+    def pause(self):
+        """Pause automatic background dispatch to remote cloud site."""
+        self.auto_dispatch = False
+        log.info('prosper_cloud_auto_dispatch_paused')
+
+    def resume(self):
+        """Resume automatic background dispatch to remote cloud site."""
+        self.auto_dispatch = True
+        log.info('prosper_cloud_auto_dispatch_resumed')
+
+    @property
+    def is_paused(self) -> bool:
+        return not self.auto_dispatch
+
     def status(self) -> dict:
         pending_count = 0
         if self.repository and hasattr(self.repository, 'count_unsynced_confirmed_events'):
@@ -347,6 +400,8 @@ class CloudOutboxDispatcher:
                 pass
         return {
             'enabled': self.enabled,
+            'auto_dispatch': self.auto_dispatch,
+            'is_paused': not self.auto_dispatch,
             'is_online': self._is_online if self.enabled else False,
             'pending_count': pending_count,
             'queue_depth': self.queue.qsize(),
@@ -386,6 +441,9 @@ class CloudOutboxDispatcher:
         if not self.enabled:
             return
         if not getattr(obs, 'confirmed', True):
+            return
+        if not self.auto_dispatch:
+            log.info('prosper_event_held_auto_dispatch_paused', extra={'event_id': event_id})
             return
 
         # Do not re-enqueue if already synced in database
@@ -448,7 +506,7 @@ class CloudOutboxDispatcher:
         Periodically checks SQLite database for confirmed events that were saved while offline.
         As soon as internet connectivity returns, dispatches them in chronological order.
         """
-        if not self.enabled or not self.repository:
+        if not self.enabled or not self.repository or not self.auto_dispatch:
             return
         try:
             unsynced = self.repository.get_unsynced_confirmed_events(limit=20)
@@ -476,6 +534,384 @@ class CloudOutboxDispatcher:
                     break
         except Exception as e:
             log.warning('prosper_backlog_sweep_error', extra={'error': str(e)})
+
+    def build_event_payload(self, event_id: str, obs: Any = None, img_fallback: Any = None, pre_payload: Optional[dict] = None) -> dict:
+        """
+        Constructs the Prosper Gate Event payload.
+        Ensures both Container 1 (Front) and Container 2 (Rear in twin events)
+        have clear, verified, distinct proof images where their container numbers are visible.
+        """
+        # Build from observed identity and stored proof; a prebuilt payload
+        # cannot bypass validation or substitute another visit's images.
+
+        event_record = self.repository.event(event_id) if self.repository else None
+        if event_record and self.snapshots:
+            manifest = self.snapshots.build_evidence_manifest(
+                event_record,
+                min_quality=getattr(self.settings, 'cloud_min_proof_quality', 2.5),
+            )
+            if isinstance(manifest, dict):
+                event_record['evidence_manifest'] = manifest
+                event_record['snapshots'] = manifest['captures']
+                event_record['primary_snapshot_id'] = manifest['primary_snapshot_id']
+                event_record['rear_snapshot_id'] = manifest['rear_snapshot_id']
+
+        cntr1 = (event_record.get('container_number') if event_record else None) or (obs.ocr.normalized_text if (obs and obs.ocr) else '')
+        cntr2 = event_record.get('container_number_2') if event_record else None
+        is_twin = bool(event_record.get('is_twin')) if event_record else False
+        if is_twin and (not cntr1 or not cntr2 or cntr1 == cntr2):
+            raise ValueError('Twin event is incomplete; both distinct container numbers are required')
+
+        for number in [cntr1] + ([cntr2] if is_twin else []):
+            if not verified_cloud_identity(event_record, obs, number, self.settings.ocr_min_confidence):
+                raise ValueError('Cloud identity lacks a complete observed checksum-valid OCR read')
+
+        containers_list = []
+        if cntr1:
+            c1_images = []
+            primary_snap_id = event_record.get('primary_snapshot_id') if event_record else None
+            rear_snap_id = event_record.get('rear_snapshot_id') if event_record else None
+            if event_record and event_record.get('snapshots') and self.snapshots:
+                cam_snapshots = {}
+                for snap in event_record['snapshots']:
+                    cam_id = snap.get('camera_id')
+                    if not cam_id:
+                        continue
+                    # Strictly exclude rear-slot snapshots from Container 1
+                    if is_twin and (
+                        (snap.get('image_path') or '').endswith('_rear.jpg') or
+                        (rear_snap_id and snap.get('id') == rear_snap_id)
+                    ):
+                        continue
+                    cam_snapshots.setdefault(cam_id, []).append(snap)
+
+                best_by_camera = {}
+                valid_identity_ids = {o['detection_id'] for o in event_record.get('ocr_results', [])
+                                      if o.get('normalized_text') == cntr1}
+                for cam_id, snaps in cam_snapshots.items():
+                    best_snap = None
+                    best_data = None
+                    best_score = -1.0
+                    for snap in snaps:
+                        try:
+                            if valid_identity_ids:
+                                snap_ts = snap.get('timestamp')
+                                observed = any(
+                                    d.get('camera_id') == snap.get('camera_id') and
+                                    (
+                                        d.get('id') in valid_identity_ids or
+                                        _within_capture_window(d.get('timestamp'), snap_ts)
+                                    )
+                                    for d in event_record.get('detections', [])
+                                )
+                                if not observed:
+                                    image_path = str(snap.get('image_path') or '').replace('\\', '/')
+                                    is_companion = image_path.rsplit('/', 1)[-1] == f'{snap.get("camera_id")}.jpg'
+                                    if not is_companion:
+                                        continue
+                            snap_p = self.snapshots.path(snap['image_path'])
+                            if not snap_p.is_file():
+                                continue
+                            data = snap_p.read_bytes()
+                            decoded = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if decoded is None or decoded.size == 0 or decoded.shape[0] < 240 or decoded.shape[1] < 320:
+                                continue
+                            quality = self.snapshots.compute_quality(decoded)
+                            if not self._proof_is_usable(decoded, quality):
+                                continue
+                            score = quality
+                            if primary_snap_id and snap.get('id') == primary_snap_id:
+                                score += 1000.0
+                            if score > best_score:
+                                best_score = score
+                                best_snap = snap
+                                best_data = data
+                        except Exception:
+                            pass
+                    if best_snap and best_data:
+                        best_by_camera[cam_id] = (best_snap, best_data)
+
+                def _cam_sort_key(c_id):
+                    c = c_id.lower()
+                    if any(k in c for k in ('1', 'front', 'top')):
+                        return (0, c)
+                    if any(k in c for k in ('2', 'left', 'side')):
+                        return (1, c)
+                    if any(k in c for k in ('3', 'rear', 'back')):
+                        return (2, c)
+                    return (3, c)
+
+                def _cam_image_type(c_id):
+                    c = (c_id or '').lower()
+                    if any(k in c for k in ('3', 'rear', 'back')):
+                        return 'REAR'
+                    if any(k in c for k in ('2', 'left', 'side')):
+                        return 'LEFT'
+                    if 'right' in c:
+                        return 'RIGHT'
+                    return 'FRONT'
+
+                for cam_id in sorted(best_by_camera.keys(), key=_cam_sort_key):
+                    snap, data = best_by_camera[cam_id]
+                    c1_images.append({
+                        'ImageType': _cam_image_type(cam_id),
+                        'CameraId': cam_id,
+                        'CapturedAt': _iso_utc(snap.get('timestamp') or (obs.detection.frame_timestamp if obs else None)),
+                        'Image': f"data:image/jpeg;base64,{base64.b64encode(proof_jpeg(data, snap, event_record)).decode('utf-8')}"
+                    })
+
+            if not c1_images and img_fallback is not None and not event_record:
+                try:
+                    if not isinstance(img_fallback, bytes):
+                        ok, buf = cv2.imencode('.jpg', img_fallback, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                        b = buf.tobytes() if ok else None
+                    else:
+                        b = img_fallback
+                    if b:
+                        c1_images.append({
+                            'ImageType': 'FRONT',
+                            'CameraId': obs.detection.camera_id if obs else 'CAM-01',
+                            'CapturedAt': _iso_utc(obs.detection.frame_timestamp if obs else None),
+                            'Image': f"data:image/jpeg;base64,{base64.b64encode(b).decode('utf-8')}"
+                        })
+                except Exception:
+                    pass
+
+            if event_record and len(c1_images) < 1:
+                raise ValueError('No verified non-blank container proof image is available for front container')
+
+            iso_s1 = str((event_record.get('iso_code_1') if event_record else None) or (getattr(obs.ocr, 'size_type', None) if obs and obs.ocr else None) or '')
+            if is_twin and not iso_s1:
+                iso_s1 = '22G1'
+            cs1 = str((event_record.get('container_size') if event_record else None) or '')
+            if not cs1 and iso_s1:
+                try:
+                    from app.ocr.validator import extract_iso_size_code as _esc
+                    _, cs1 = _esc(iso_s1)
+                    cs1 = cs1 or ''
+                except Exception:
+                    pass
+            if '20' in cs1 or iso_s1.startswith('2'):
+                size_1 = '20'
+            elif '45' in cs1 or iso_s1.startswith('L'):
+                size_1 = '45'
+            else:
+                size_1 = '40'
+            conf_1 = identity_confidence(event_record, obs, cntr1)
+            containers_list.append({
+                'ContainerNumber': cntr1,
+                'DetectionConfidence': round(detection_confidence(event_record, obs, cntr1), 2),
+                'ContainerNumberConfidence': round(conf_1, 2),
+                'Size': size_1,
+                'ContainerSize': cs1 or None,
+                'SizeCode': iso_s1 or None,
+                'Position': 'FRONT' if is_twin else 'SINGLE',
+                'Images': c1_images
+            })
+
+        if is_twin and cntr2 and cntr2 != cntr1:
+            c2_images = []
+            if event_record and event_record.get('snapshots') and self.snapshots:
+                primary_snap_id = event_record.get('primary_snapshot_id')
+                rear_snap_id = event_record.get('rear_snapshot_id')
+                cam_c2_snapshots = {}
+                for snap in event_record['snapshots']:
+                    # Strictly exclude front primary snapshot from rear container
+                    if primary_snap_id and snap.get('id') == primary_snap_id:
+                        continue
+                    is_rear_snap = (
+                        (rear_snap_id and snap.get('id') == rear_snap_id) or
+                        (snap.get('image_path') or '').endswith('_rear.jpg') or
+                        any(k in (snap.get('camera_id') or '').lower() for k in ('rear', '-3'))
+                    )
+                    if is_rear_snap:
+                        cam_id = snap.get('camera_id') or 'CAM-02'
+                        cam_c2_snapshots.setdefault(cam_id, []).append(snap)
+
+                if not cam_c2_snapshots:
+                    # Fallback to any snapshot distinct from primary_snap_id
+                    for snap in event_record['snapshots']:
+                        if not primary_snap_id or snap.get('id') != primary_snap_id:
+                            cam_id = snap.get('camera_id') or 'CAM-02'
+                            cam_c2_snapshots.setdefault(cam_id, []).append(snap)
+
+                best_c2_by_camera = {}
+                valid_identity_ids_2 = {o['detection_id'] for o in event_record.get('ocr_results', [])
+                                        if o.get('normalized_text') == cntr2}
+                for cam_id, snaps in cam_c2_snapshots.items():
+                    best_snap = None
+                    best_data = None
+                    best_score = -1.0
+                    for snap in snaps:
+                        try:
+                            snap_p = self.snapshots.path(snap['image_path'])
+                            if not snap_p.is_file():
+                                continue
+                            data = snap_p.read_bytes()
+                            decoded = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if decoded is None or min(decoded.shape[:2]) < 240:
+                                continue
+                            quality = self.snapshots.compute_quality(decoded)
+                            if not self._proof_is_usable(decoded, quality):
+                                continue
+                            score = quality
+                            if rear_snap_id and snap.get('id') == rear_snap_id:
+                                score += 1000.0
+                            if (snap.get('image_path') or '').endswith('_rear.jpg'):
+                                score += 500.0
+                            if valid_identity_ids_2:
+                                snap_ts = snap.get('timestamp')
+                                observed = any(
+                                    d.get('camera_id') == snap.get('camera_id') and
+                                    (d.get('id') in valid_identity_ids_2 or _within_capture_window(d.get('timestamp'), snap_ts))
+                                    for d in event_record.get('detections', [])
+                                )
+                                if observed:
+                                    score += 200.0
+                            if score > best_score:
+                                best_score = score
+                                best_snap = snap
+                                best_data = data
+                        except Exception:
+                            pass
+                    if best_snap and best_data:
+                        best_c2_by_camera[cam_id] = (best_snap, best_data)
+
+                for cam_id in sorted(best_c2_by_camera.keys()):
+                    snap, data = best_c2_by_camera[cam_id]
+                    c2_images.append({
+                        'ImageType': 'REAR',
+                        'CameraId': cam_id,
+                        'CapturedAt': _iso_utc(snap.get('timestamp') or (obs.detection.frame_timestamp if obs else None)),
+                        'Image': f"data:image/jpeg;base64,{base64.b64encode(proof_jpeg(data, snap, event_record)).decode('utf-8')}"
+                    })
+
+            if not c2_images:
+                raise ValueError('Rear slot proof image is missing; cloud publication deferred')
+            iso_s2 = str((event_record.get('iso_code_2') if event_record else None) or '')
+            if is_twin and not iso_s2:
+                iso_s2 = '22G1'
+            cs2 = str((event_record.get('container_size_2') if event_record else None) or '')
+            if not cs2 and iso_s2:
+                try:
+                    from app.ocr.validator import extract_iso_size_code as _esc
+                    _, cs2 = _esc(iso_s2)
+                    cs2 = cs2 or ''
+                except Exception:
+                    pass
+            size_2 = '20' if ('20' in cs2 or iso_s2.startswith('2')) else ('45' if ('45' in cs2 or iso_s2.startswith('L')) else '40')
+            conf_2 = identity_confidence(event_record, obs, cntr2)
+            containers_list.append({
+                'ContainerNumber': cntr2,
+                'DetectionConfidence': round(detection_confidence(event_record, obs, cntr2), 2),
+                'ContainerNumberConfidence': round(conf_2, 2),
+                'Size': size_2,
+                'ContainerSize': cs2 or None,
+                'SizeCode': iso_s2 or None,
+                'Position': 'REAR',
+                'Images': c2_images
+            })
+
+        if not containers_list and obs and obs.ocr and obs.ocr.normalized_text:
+            containers_list.append({
+                'ContainerNumber': obs.ocr.normalized_text,
+                'DetectionConfidence': round(float(getattr(obs.detection, 'confidence', 0.0)), 2),
+                'ContainerNumberConfidence': round(float(obs.ocr.confidence), 2),
+                'Size': '20',
+                'Position': 'FRONT',
+                'Images': [{
+                    'ImageType': 'FRONT',
+                    'CameraId': obs.detection.camera_id if obs else 'CAM-01',
+                    'CapturedAt': _iso_utc(obs.detection.frame_timestamp if obs else None),
+                    'Image': FALLBACK_IMAGE_DATA_URI
+                }]
+            })
+
+        if obs and hasattr(obs, 'detection'):
+            dt_captured = obs.detection.frame_timestamp
+        elif event_record and event_record.get('timestamp'):
+            try:
+                ts_str = event_record['timestamp'].rstrip('Z')
+                dt_captured = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+            except Exception:
+                dt_captured = datetime.now(timezone.utc)
+        else:
+            dt_captured = datetime.now(timezone.utc)
+
+        visit_id = f"VISIT-{dt_captured.strftime('%Y%m%d')}-{event_id[:8].upper()}"
+        direction = (
+            obs.direction.upper() if (obs and hasattr(obs, 'direction') and obs.direction)
+            else ((event_record.get('event_type') or 'ENTRY').upper() if event_record else 'ENTRY')
+        )
+        event_type = 'GATE_OUT' if direction in ('EXIT', 'OUT', 'GATE_OUT') else 'GATE_IN'
+
+        return {
+            'id': event_id,
+            'VisitId': visit_id,
+            'EventType': event_type,
+            'DeviceId': self.device_uuid,
+            'CapturedAt': _iso_utc(dt_captured),
+            'containerNumber': cntr1,
+            'Truck': {'TruckNumber': 'NA'},
+            'Driver': None,
+            'Containers': containers_list
+        }
+
+    def dispatch_event(self, event_id: str) -> dict:
+        """
+        Manually dispatches a single reviewed gate event to the Prosper cloud site.
+        Validates evidence images for both containers (in twin events) before sending.
+        """
+        if not self.enabled:
+            return {'success': False, 'status': 'DISABLED', 'error': 'Prosper cloud sync is not enabled'}
+        if not self.repository:
+            return {'success': False, 'status': 'ERROR', 'error': 'Repository unavailable'}
+
+        event_record = self.repository.event(event_id)
+        if not event_record:
+            return {'success': False, 'status': 'NOT_FOUND', 'error': f'Event {event_id} not found'}
+
+        try:
+            payload = self.build_event_payload(event_id)
+        except Exception as exc:
+            return {'success': False, 'status': 'PAYLOAD_ERROR', 'error': str(exc)}
+
+        try:
+            res = self.session.post_gate_event(payload)
+            if res in (True, 'CONFLICT') or isinstance(res, dict):
+                cloud_ev_id = None
+                if isinstance(res, dict):
+                    cloud_ev_id = res.get('eventId') or res.get('visitDatabaseId')
+                self.repository.mark_cloud_synced(event_id, cloud_event_id=cloud_ev_id)
+                self._is_online = True
+                self._last_sync_time = datetime.now(timezone.utc).isoformat()
+                self._last_error = None
+                log.info('prosper_manual_dispatch_success', extra={'event_id': event_id, 'cloud_event_id': cloud_ev_id})
+                return {
+                    'success': True,
+                    'status': 'SYNCED',
+                    'cloud_event_id': cloud_ev_id,
+                    'visit_id': payload.get('VisitId'),
+                    'message': 'Event successfully dispatched to Prosper site'
+                }
+            else:
+                self._is_online = False
+                err_msg = self._last_error or f"Site returned status: {res}"
+                log.warning('prosper_manual_dispatch_rejected', extra={'event_id': event_id, 'status': str(res)})
+                return {
+                    'success': False,
+                    'status': str(res),
+                    'error': err_msg
+                }
+        except Exception as exc:
+            self._is_online = False
+            self._last_error = str(exc)
+            log.exception('prosper_manual_dispatch_exception', extra={'event_id': event_id})
+            return {
+                'success': False,
+                'status': 'EXCEPTION',
+                'error': str(exc)
+            }
 
     def _run_loop(self):
         last_sweep = time.monotonic()
@@ -523,308 +959,7 @@ class CloudOutboxDispatcher:
                             'event_id': event_id, 'canonical_event_id': canonical})
                         self.queue.task_done()
                         continue
-                if pre_payload and isinstance(pre_payload, dict):
-                    payload = pre_payload
-                else:
-                    # Query repository for full event record and associated multi-camera snapshots
-                    event_record = self.repository.event(event_id) if self.repository else None
-                    if event_record and self.snapshots:
-                        # Use the same canonical capture set exposed by the UI;
-                        # never re-rank a different set for the cloud payload.
-                        manifest = self.snapshots.build_evidence_manifest(
-                            event_record,
-                            min_quality=getattr(self.settings, 'cloud_min_proof_quality', 2.5),
-                        )
-                        if isinstance(manifest, dict):
-                            event_record['evidence_manifest'] = manifest
-                            event_record['snapshots'] = manifest['captures']
-                            event_record['primary_snapshot_id'] = manifest['primary_snapshot_id']
-                            event_record['rear_snapshot_id'] = manifest['rear_snapshot_id']
-                    cntr1 = (event_record.get('container_number') if event_record else None) or (obs.ocr.normalized_text if (obs and obs.ocr) else '')
-                    cntr2 = event_record.get('container_number_2') if event_record else None
-                    is_twin = bool(event_record.get('is_twin')) if event_record else False
-                    if is_twin and (not cntr1 or not cntr2 or cntr1 == cntr2):
-                        raise ValueError('Twin event is incomplete; both distinct container numbers are required')
-
-                    containers_list = []
-                    if cntr1:
-                        c1_images = []
-                        primary_snap_id = event_record.get('primary_snapshot_id') if event_record else None
-                        if event_record and event_record.get('snapshots') and self.snapshots:
-                            # Group snapshots by physical camera_id.
-                            # Each camera that covered this event sends exactly ONE best image
-                            # where the container is clearly visible.
-                            cam_snapshots = {}
-                            for snap in event_record['snapshots']:
-                                cam_id = snap.get('camera_id')
-                                if not cam_id:
-                                    continue
-                                # Exclude rear-slot snapshots from container 1 if is_twin
-                                if is_twin and (snap.get('image_path') or '').endswith('_rear.jpg'):
-                                    continue
-                                cam_snapshots.setdefault(cam_id, []).append(snap)
-
-                            best_by_camera = {}
-                            valid_identity_ids = {o['detection_id'] for o in event_record.get('ocr_results', [])
-                                                  if o.get('valid_check_digit') and o.get('normalized_text') == cntr1}
-                            for cam_id, snaps in cam_snapshots.items():
-                                best_snap = None
-                                best_data = None
-                                best_score = -1.0
-                                for snap in snaps:
-                                    try:
-                                        # validated event/camera. Companion
-                                        # cameras have their own detection ID;
-                                        # requiring the front camera's exact ID
-                                        # incorrectly discarded valid side/rear
-                                        # proof frames.
-                                        if valid_identity_ids:
-                                            snap_ts = snap.get('timestamp')
-                                            observed = any(
-                                                d.get('camera_id') == snap.get('camera_id') and
-                                                (
-                                                    d.get('id') in valid_identity_ids or
-                                                    _within_capture_window(d.get('timestamp'), snap_ts)
-                                                )
-                                                for d in event_record.get('detections', [])
-                                            )
-                                            if not observed:
-                                                # Companion frames are persisted
-                                                # as {event_id}/{camera_id}.jpg
-                                                # and are linked to this event,
-                                                # but they do not get a separate
-                                                # OCR detection row.  Keep them
-                                                # when their own quality checks
-                                                # pass; otherwise only the OCR
-                                                # camera reaches Prosper.
-                                                image_path = str(snap.get('image_path') or '').replace('\\', '/')
-                                                is_companion = image_path.rsplit('/', 1)[-1] == f'{snap.get("camera_id")}.jpg'
-                                                if not is_companion:
-                                                    continue
-                                        snap_p = self.snapshots.path(snap['image_path'])
-                                        if not snap_p.is_file():
-                                            continue
-                                        data = snap_p.read_bytes()
-                                        decoded = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-                                        if decoded is None or decoded.size == 0:
-                                            continue
-                                        if decoded.shape[0] < 240 or decoded.shape[1] < 320:
-                                            continue
-                                        quality = self.snapshots.compute_quality(decoded)
-                                        if not self._proof_is_usable(decoded, quality):
-                                            continue
-                                        score = quality
-                                        if primary_snap_id and snap.get('id') == primary_snap_id:
-                                            score += 1000.0
-                                        if score > best_score:
-                                            best_score = score
-                                            best_snap = snap
-                                            best_data = data
-                                    except Exception:
-                                        pass
-                                if best_snap and best_data:
-                                    best_by_camera[cam_id] = (best_snap, best_data)
-
-                            def _cam_sort_key(c_id):
-                                c = c_id.lower()
-                                if any(k in c for k in ('1', 'front', 'top')):
-                                    return (0, c)
-                                if any(k in c for k in ('2', 'left', 'side')):
-                                    return (1, c)
-                                if any(k in c for k in ('3', 'rear', 'back')):
-                                    return (2, c)
-                                return (3, c)
-
-                            def _cam_image_type(c_id):
-                                c = (c_id or '').lower()
-                                if any(k in c for k in ('3', 'rear', 'back')):
-                                    return 'REAR'
-                                if any(k in c for k in ('2', 'left', 'side')):
-                                    return 'LEFT'
-                                if 'right' in c:
-                                    return 'RIGHT'
-                                return 'FRONT'
-
-                            for cam_id in sorted(best_by_camera.keys(), key=_cam_sort_key):
-                                snap, data = best_by_camera[cam_id]
-                                c1_images.append({
-                                    'ImageType': _cam_image_type(cam_id),
-                                    'CameraId': cam_id,
-                                    'CapturedAt': _iso_utc(snap.get('timestamp') or (obs.detection.frame_timestamp if obs else None)),
-                                    'Image': f"data:image/jpeg;base64,{base64.b64encode(proof_jpeg(data, snap, event_record)).decode('utf-8')}"
-                                })
-                        if not c1_images and img is not None and not event_record:
-                            try:
-                                if not isinstance(img, bytes):
-                                    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                                    b = buf.tobytes() if ok else None
-                                else:
-                                    b = img
-                                if b:
-                                    c1_images.append({
-                                        'ImageType': 'FRONT',
-                                        'CameraId': obs.detection.camera_id if obs else 'CAM-01',
-                                        'CapturedAt': _iso_utc(obs.detection.frame_timestamp if obs else None),
-                                        'Image': f"data:image/jpeg;base64,{base64.b64encode(b).decode('utf-8')}"
-                                    })
-                            except Exception:
-                                pass
-
-                        if event_record and len(c1_images) < 1:
-                            raise ValueError('No verified non-blank container proof image is available; cloud publication deferred')
-
-                        iso_s1 = str((event_record.get('iso_code_1') if event_record else None) or (getattr(obs.ocr, 'size_type', None) if obs and obs.ocr else None) or '')
-                        if event_record and event_record.get('is_twin') and not iso_s1.startswith('2'):
-                            raise ValueError('Twin container 1 is missing a verified 20-foot ISO size code')
-                        cs1 = str((event_record.get('container_size') if event_record else None) or '')
-                        # Derive full human-readable size from ISO code when container_size not pre-computed
-                        if not cs1 and iso_s1:
-                            try:
-                                from app.ocr.validator import extract_iso_size_code as _esc
-                                _, cs1 = _esc(iso_s1)
-                                cs1 = cs1 or ''
-                            except Exception:
-                                pass
-                        # Map to cloud API size value: "20", "40", "45"
-                        if '20' in cs1 or iso_s1.startswith('2'):
-                            size_1 = '20'
-                        elif '45' in cs1 or iso_s1.startswith('L'):
-                            size_1 = '45'
-                        else:
-                            size_1 = '40'
-                        conf_1 = float(getattr(obs.ocr, 'confidence', 0.95)) if (obs and obs.ocr and obs.ocr.confidence) else 0.95
-                        containers_list.append({
-                            'ContainerNumber': cntr1,
-                            'DetectionConfidence': round(float(getattr(obs.detection, 'confidence', 0.0)), 2),
-                            'ContainerNumberConfidence': round(conf_1, 2),
-                            'Size': size_1,
-                            'ContainerSize': cs1 or None,
-                            'SizeCode': iso_s1 or None,
-                            'Position': 'FRONT' if is_twin else 'SINGLE',
-                            'Images': c1_images
-                        })
-
-                    if is_twin and cntr2 and cntr2 != cntr1:
-                        c2_images = []
-                        if event_record and event_record.get('snapshots') and self.snapshots:
-                            cam_c2_snapshots = {}
-                            for snap in event_record['snapshots']:
-                                is_rear_snap = (
-                                    snap.get('id') == event_record.get('rear_snapshot_id') or
-                                    (snap.get('image_path') or '').endswith('_rear.jpg') or
-                                    any(k in (snap.get('camera_id') or '').lower() for k in ('rear', '-3'))
-                                )
-                                if is_rear_snap:
-                                    cam_id = snap.get('camera_id') or 'CAM-02'
-                                    cam_c2_snapshots.setdefault(cam_id, []).append(snap)
-
-                            best_c2_by_camera = {}
-                            for cam_id, snaps in cam_c2_snapshots.items():
-                                best_snap = None
-                                best_data = None
-                                best_score = -1.0
-                                for snap in snaps:
-                                    try:
-                                        snap_p = self.snapshots.path(snap['image_path'])
-                                        if not snap_p.is_file():
-                                            continue
-                                        data = snap_p.read_bytes()
-                                        decoded = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-                                        if decoded is None or min(decoded.shape[:2]) < 240:
-                                            continue
-                                        quality = self.snapshots.compute_quality(decoded)
-                                        if not self._proof_is_usable(decoded, quality):
-                                            continue
-                                        score = quality
-                                        if snap.get('id') == event_record.get('rear_snapshot_id'):
-                                            score += 1000.0
-                                        if score > best_score:
-                                            best_score = score
-                                            best_snap = snap
-                                            best_data = data
-                                    except Exception:
-                                        pass
-                                if best_snap and best_data:
-                                    best_c2_by_camera[cam_id] = (best_snap, best_data)
-
-                            for cam_id in sorted(best_c2_by_camera.keys()):
-                                snap, data = best_c2_by_camera[cam_id]
-                                c2_images.append({
-                                    'ImageType': 'REAR',
-                                    'CameraId': cam_id,
-                                    'CapturedAt': _iso_utc(snap.get('timestamp') or (obs.detection.frame_timestamp if obs else None)),
-                                    'Image': f"data:image/jpeg;base64,{base64.b64encode(proof_jpeg(data, snap, event_record)).decode('utf-8')}"
-                                })
-
-                        if not c2_images:
-                            raise ValueError('Rear slot proof image is missing; cloud publication deferred')
-                        iso_s2 = str((event_record.get('iso_code_2') if event_record else None) or '')
-                        if event_record and event_record.get('is_twin') and not iso_s2.startswith('2'):
-                            raise ValueError('Twin container 2 is missing a verified 20-foot ISO size code')
-                        cs2 = str((event_record.get('container_size_2') if event_record else None) or '')
-                        if not cs2 and iso_s2:
-                            try:
-                                from app.ocr.validator import extract_iso_size_code as _esc
-                                _, cs2 = _esc(iso_s2)
-                                cs2 = cs2 or ''
-                            except Exception:
-                                pass
-                        size_2 = '20' if ('20' in cs2 or iso_s2.startswith('2')) else ('45' if ('45' in cs2 or iso_s2.startswith('L')) else '40')
-                        conf_2 = float(event_record.get('confidence_2') or 0.95) if event_record else 0.95
-                        containers_list.append({
-                            'ContainerNumber': cntr2,
-                            'ContainerNumberConfidence': round(conf_2, 2),
-                            'Size': size_2,
-                            'ContainerSize': cs2 or None,
-                            'SizeCode': iso_s2 or None,
-                            'Position': 'REAR',
-                            'Images': c2_images or (c1_images[:1] if c1_images else [])
-                        })
-
-                    if not containers_list and obs and obs.ocr and obs.ocr.normalized_text:
-                        containers_list.append({
-                            'ContainerNumber': obs.ocr.normalized_text,
-                            'DetectionConfidence': round(float(getattr(obs.detection, 'confidence', 0.0)), 2),
-                            'ContainerNumberConfidence': round(float(obs.ocr.confidence), 2),
-                            'Size': '20',
-                            'Position': 'FRONT',
-                            'Images': [{
-                                'ImageType': 'FRONT',
-                                'CameraId': obs.detection.camera_id if obs else 'CAM-01',
-                                'CapturedAt': _iso_utc(obs.detection.frame_timestamp if obs else None),
-                                'Image': FALLBACK_IMAGE_DATA_URI
-                            }]
-                        })
-
-                    if obs and hasattr(obs, 'detection'):
-                        dt_captured = obs.detection.frame_timestamp
-                    elif event_record and event_record.get('timestamp'):
-                        try:
-                            ts_str = event_record['timestamp'].rstrip('Z')
-                            dt_captured = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
-                        except Exception:
-                            dt_captured = datetime.now(timezone.utc)
-                    else:
-                        dt_captured = datetime.now(timezone.utc)
-
-                    visit_id = f"VISIT-{dt_captured.strftime('%Y%m%d')}-{event_id[:8].upper()}"
-                    direction = (
-                        obs.direction.upper() if (obs and hasattr(obs, 'direction') and obs.direction)
-                        else ((event_record.get('event_type') or 'ENTRY').upper() if event_record else 'ENTRY')
-                    )
-                    event_type = 'GATE_OUT' if direction in ('EXIT', 'OUT', 'GATE_OUT') else 'GATE_IN'
-
-                    payload = {
-                        'id': event_id,
-                        'VisitId': visit_id,
-                        'EventType': event_type,
-                        'DeviceId': self.device_uuid,
-                        'CapturedAt': _iso_utc(dt_captured),
-                        'containerNumber': cntr1,
-                        'Truck': {'TruckNumber': 'NA'},
-                        'Driver': None,
-                        'Containers': containers_list
-                    }
+                payload = self.build_event_payload(event_id, obs=obs, img_fallback=img, pre_payload=pre_payload)
 
                 success = self.session.post_gate_event(payload)
                 if success == 'REJECTED' and self.runtime:

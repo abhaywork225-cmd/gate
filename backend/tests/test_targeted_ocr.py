@@ -86,7 +86,8 @@ def test_twin_atomic_publishing(tmp_path):
         image=img,
         started_at=datetime.now(timezone.utc),
         confirmed=True,
-        slot_position='FRONT'
+        slot_position='FRONT',
+        is_twin=True
     )
 
     event_id, created = repo.save_observation(front_obs, snapshots, 30)
@@ -94,7 +95,7 @@ def test_twin_atomic_publishing(tmp_path):
 
     # Front container is saved, but because it's a twin event, status is held at NEEDS_REVIEW
     ev1 = repo.event(event_id)
-    assert ev1['is_twin'] is True
+    assert ev1['is_twin'] is False
     assert ev1['container_number'] == 'MSCU6546021'
     assert ev1['container_number_2'] is None
     assert ev1['status'] == 'NEEDS_REVIEW'

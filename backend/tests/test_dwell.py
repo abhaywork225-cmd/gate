@@ -98,6 +98,7 @@ def test_tracker_churn_has_one_event_then_clear_allows_next(settings, repository
     settings.ocr_confirmations = 1
     runtime = GateRuntime(settings, [camera], repository, snapshots)
     runtime.detector = Mock()
+    runtime.model_status['detector'] = 'READY'
     runtime.ocr = Mock()
     runtime.ocr.read.return_value = OCRRead('CSQU3054383', .99)
     def run(t, boxes=((20,20,70,80),)):
@@ -110,6 +111,7 @@ def test_tracker_churn_has_one_event_then_clear_allows_next(settings, repository
             runtime._process_saved_ocr(key)
             runtime.queue.task_done()
     run(0)
+    run(1)  # Stable occupancy is required before OCR.
     event = runtime.occupancy[camera.id].current.event_id
     assert event
     for t in range(1, 100):
@@ -121,6 +123,7 @@ def test_tracker_churn_has_one_event_then_clear_allows_next(settings, repository
     for t in range(100,108):
         run(t, ())
     run(108)
+    run(109)
     assert repository.events()['total'] == 2
     assert runtime.ocr.read.call_count == 2
 

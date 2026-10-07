@@ -27,6 +27,28 @@ def serialize(record):
     return {key: value.isoformat() + 'Z' if isinstance(value, datetime) else value for key, value in result.items()}
 
 
+def review_feedback(event, readings):
+    """Expose a complete observed candidate separately from confirmed identity."""
+    from app.domain import OCRRead
+    from app.ocr.validator import ContainerValidator
+    candidates = [ContainerValidator().validate(OCRRead(o.get('raw_text', ''), o.get('confidence', 0)))
+                  for o in readings]
+    complete = [v for v in candidates if v.valid_format]
+    best = max(complete, key=lambda v: (v.valid_check_digit, v.confidence), default=None)
+    event['candidate_number'] = best.normalized_text if best and not event.get('container_number') else None
+    event['review_reason'] = None
+    if event.get('status') != 'NEEDS_REVIEW':
+        return
+    if not best:
+        event['review_reason'] = 'OCR did not read a complete container number. Check the number crop.'
+    elif not best.valid_check_digit:
+        event['review_reason'] = 'Number read, but the printed check digit does not match the ISO checksum.'
+    elif event.get('is_twin') and not event.get('container_number_2'):
+        event['review_reason'] = 'The second container identity is not confirmed.'
+    else:
+        event['review_reason'] = 'Waiting for matching independent OCR readings with sufficient confidence.'
+
+
 def ocr_similarity_score(s1: str | None, s2: str | None) -> float:
     """Return character overlap ratio (0.0 to 1.0) between two OCR strings,
     robust to single character shifts, insertions, and deletions."""
@@ -174,7 +196,15 @@ class GateRepository:
             with self._write_lock, self.db.sessions.begin() as session:
                 prior = session.scalar(select(DetectionRecord).where(DetectionRecord.origin_key == obs.origin_key))
                 if prior:
-                    return prior.event_id, False
+                    saved = session.get(GateEvent, prior.event_id)
+                    if not (saved and saved.status == 'NEEDS_REVIEW' and obs.confirmed
+                            and getattr(obs.ocr, 'valid_check_digit', False)):
+                        return prior.event_id, False
+                    # A review observation is not terminal. Keep its evidence,
+                    # then append the newly confirmed read under the active origin.
+                    prior.origin_key = f'{obs.origin_key[:110]}:evidence:{prior.id}'
+                    ongoing_event_id = prior.event_id
+                    session.flush()
                 number = obs.ocr.normalized_text if (obs.confirmed or getattr(obs.ocr, 'valid_check_digit', False)) else None
                 delta = timedelta(seconds=dedup_seconds)
                 existing = None
@@ -195,7 +225,16 @@ class GateRepository:
                     bool(getattr(obs.ocr, 'valid_check_digit', False))
                 )
 
-                if number:
+                explicit_new_visit = (
+                    obs.origin_key.startswith('dwell:') and getattr(obs, 'event_id', None)
+                    and (not ongoing_event_id or ongoing_event_id == obs.event_id)
+                    and session.get(GateEvent, obs.event_id) is None
+                )
+                if explicit_new_visit:
+                    # The occupancy tracker assigns a fresh visit after observed
+                    # clearance. A recent identical number is a new movement.
+                    pass
+                elif number:
                     existing = session.scalar(select(GateEvent).where(
                         GateEvent.gate_id == obs.gate_id,
                         (GateEvent.container_number == number) |
@@ -448,8 +487,7 @@ class GateRepository:
                 is_40ft = size_str.startswith('4') or '40' in size_str or '45' in size_str
                 obs_is_twin = getattr(obs, 'is_twin', False)
                 is_twin_event = (
-                    obs_is_twin or (existing and existing.is_twin) or is_rear_slot or
-                    (size_str.startswith('2') and not str(obs.origin_key).startswith('dwell:'))
+                    obs_is_twin or (existing and existing.is_twin) or is_rear_slot
                 ) and not is_40ft
                 if created:
                     assign_to_rear = is_twin_event and is_rear_slot
@@ -659,6 +697,7 @@ class GateRepository:
                     DetectionRecord.event_id == item['id'],
                     func.lower(DetectionRecord.class_name) == 'feet'
                 )) is not None
+                review_feedback(item, [serialize(o) for o in session.scalars(select(OCRResult).join(DetectionRecord).where(DetectionRecord.event_id == item['id']))])
                 ocr_texts = session.scalars(select(OCRResult.normalized_text).join(DetectionRecord).where(
                     DetectionRecord.event_id == item['id']
                 )).all()
@@ -699,6 +738,7 @@ class GateRepository:
             result['detections'] = [serialize(d) for d in detections]
             result['ocr_results'] = [serialize(o) for o in session.scalars(select(OCRResult).where(
                 OCRResult.detection_id.in_([d.id for d in detections])))]
+            review_feedback(result, result['ocr_results'])
             snapshots_list = [serialize(s) for s in session.scalars(select(Snapshot).where(Snapshot.event_id == event_id))]
             if not snapshots_list:
                 # Recover legacy/event files written before snapshot metadata
@@ -764,6 +804,9 @@ class GateRepository:
                     return None
                 matching = {o['detection_id'] for o in result['ocr_results']
                             if o.get('valid_check_digit') and o.get('normalized_text') == number}
+                if not matching:
+                    matching = {o['detection_id'] for o in result['ocr_results']
+                                if o.get('normalized_text') == number}
                 eligible = [d for d in detections if d.id in matching
                             and d.origin_key.endswith(':rear') == rear]
                 if not eligible:
@@ -786,8 +829,27 @@ class GateRepository:
                     if candidate_cam:
                         return candidate_cam
                 return None
-            front_snap = identity_proof(result.get('container_number'), False)
-            rear_snap = identity_proof(result.get('container_number_2'), True) if result.get('is_twin') else None
+
+            matched_front = identity_proof(result.get('container_number'), False)
+            if matched_front:
+                front_snap = matched_front
+            elif not front_snap and snapshots_list:
+                front_snap = next((s for s in snapshots_list if not (s.get('image_path') or '').endswith('_rear.jpg')), snapshots_list[0])
+
+            matched_rear = identity_proof(result.get('container_number_2'), True) if result.get('is_twin') else None
+            if matched_rear:
+                rear_snap = matched_rear
+            elif result.get('is_twin'):
+                if not rear_snap:
+                    rear_snap = next((s for s in snapshots_list if (s.get('image_path') or '').endswith('_rear.jpg')), None)
+                if not rear_snap and snapshots_list:
+                    rear_snap = next((s for s in snapshots_list if front_snap and s['id'] != front_snap['id']), None)
+
+            if result.get('is_twin') and front_snap and rear_snap and front_snap['id'] == rear_snap['id'] and len(snapshots_list) > 1:
+                diff = next((s for s in snapshots_list if s['id'] != front_snap['id']), None)
+                if diff:
+                    rear_snap = diff
+
             primary_cam = front_snap['camera_id'] if front_snap else None
             result['primary_camera_id'] = primary_cam
             result['primary_snapshot_id'] = front_snap['id'] if front_snap else None

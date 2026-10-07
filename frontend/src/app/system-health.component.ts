@@ -25,7 +25,21 @@ import { Health, Metrics } from './gate-api.service';
       <div class="gpu-memory"><small>GPU MEMORY</small><span>{{ stale() || metrics()?.gpu_memory_used_mb == null ? 'Unavailable' : (metrics()?.gpu_memory_used_mb | number:'1.0-0') + ' / ' + (metrics()?.gpu_memory_total_mb | number:'1.0-0') + ' MB' }}</span></div>
       @if (metrics()?.gpu_power_watts == null) {<p class="telemetry-note">Power readings are not exposed by this device or driver.</p>}
     </section>
-    <div class="context-block"><small>CONNECTED SITE</small><strong>Not configured</strong><span>Site setup deferred</span></div>
+    <div class="context-block">
+      <small>CLOUD DISPATCH MODE</small>
+      @if (health()?.cloud_sync?.enabled) {
+        @if (health()?.cloud_sync?.is_paused) {
+          <strong style="color: #f59e0b;">PAUSED (MANUAL REVIEW)</strong>
+          <span>Held locally until operator click</span>
+        } @else {
+          <strong style="color: #10b981;">AUTO DISPATCH ACTIVE</strong>
+          <span>Auto-publishing to Smart Yard</span>
+        }
+      } @else {
+        <strong>DISABLED</strong>
+        <span>Local edge storage only</span>
+      }
+    </div>
     <div class="context-block"><small>ADMIN SESSION</small><strong>Not signed in</strong><span>Local testing · login setup deferred</span></div>
   </aside>`
 })

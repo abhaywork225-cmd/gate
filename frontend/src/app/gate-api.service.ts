@@ -21,6 +21,8 @@ export interface LaneCalibration { camera_id: string; occupancy_roi: number[]; l
 export interface CameraSource { id: string; name: string; host?: string; configured: boolean; discovered?: boolean; connection_hint?: string; }
 export interface DiscoveryStatus { state: string; found: number; message: string; }
 export interface GateEvent {
+  candidate_number?: string | null;
+  review_reason?: string | null;
   id: string;
   gate_id: string;
   timestamp: string;
@@ -33,6 +35,9 @@ export interface GateEvent {
   container_number_2?: string | null;
   size_code_2?: string | null;
   container_size_2?: string | null;
+  cloud_synced?: boolean;
+  cloud_synced_at?: string | null;
+  cloud_event_id?: string | null;
 }
 export interface Detection { id?: string; camera_id: string; class_name: string; confidence: number; bbox: number[]; timestamp?: string; frame_timestamp?: string; track_id?: number; }
 export interface OCR { id: string; raw_text: string; normalized_text: string; confidence: number; validation_status: string; }
@@ -46,11 +51,14 @@ export interface EventDetail extends GateEvent {
   primary_snapshot_id?: string;
   rear_snapshot_id?: string;
   ocr_crops?: OcrCrop[];
+  cloud_auto_dispatch?: boolean;
 }
 export interface EventPage { items: GateEvent[]; total: number; offset: number; limit: number; }
 export interface OcrSpool { total: number; pending: number; failed: number; }
 export interface CloudSyncStatus {
   enabled: boolean;
+  auto_dispatch?: boolean;
+  is_paused?: boolean;
   is_online: boolean;
   pending_count: number;
   queue_depth: number;
@@ -150,5 +158,23 @@ export class GateApi {
 
   retryCloudSync() {
     return this.http.post<{ triggered: boolean; pending: number }>('/api/cloud-sync/retry', {});
+  }
+
+  dispatchCloud(id: string) {
+    return this.http.post<{success: boolean; status: string; cloud_event_id?: string; visit_id?: string; message?: string}>(
+      `/api/gate-events/${encodeURIComponent(id)}/dispatch-cloud`, {}
+    );
+  }
+
+  pauseCloudSync() {
+    return this.http.post<{paused: boolean; auto_dispatch: boolean}>('/api/cloud-sync/pause', {});
+  }
+
+  resumeCloudSync() {
+    return this.http.post<{paused: boolean; auto_dispatch: boolean}>('/api/cloud-sync/resume', {});
+  }
+
+  toggleCloudSyncAuto() {
+    return this.http.post<{auto_dispatch: boolean; is_paused: boolean}>('/api/cloud-sync/toggle-auto-dispatch', {});
   }
 }

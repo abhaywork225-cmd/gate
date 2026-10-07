@@ -42,22 +42,13 @@ class EventManager:
             evidence.reads.append(validation)
             evidence.last_sequence = job.frame.sequence
         evidence.reads = evidence.reads[-self.settings.ocr_max_attempts:]
-        good = [r for r in evidence.reads if r and r.valid_check_digit]
+        good = [r for r in evidence.reads if r and r.valid_check_digit
+                and r.confidence >= self.settings.ocr_min_confidence]
         votes = Counter(r.normalized_text for r in good)
         best, count = votes.most_common(1)[0] if votes else (None, 0)
         tied = sum(v == count for v in votes.values()) > 1
-        confirmed = (count >= self.settings.ocr_confirmations and not tied) or (count >= 1 and not tied)
-        # A dwell track can end before the configured vote count is reached
-        # (camera handoff, truck leaving the ROI, or a short queue passage).
-        # If at least one valid check-digit read exists, confirm it.
-        dwell_end_fallback = (
-            job.origin_key.startswith('dwell:') and
-            count >= 1 and not tied
-        )
-        if dwell_end_fallback:
-            confirmed = True
-        if not confirmed and len(evidence.reads) >= self.settings.ocr_max_attempts and count >= 1 and not tied:
-            confirmed = True
+        confirmed = (count >= self.settings.ocr_confirmations and not tied
+                     and getattr(job, 'is_stationary', True))
         if not confirmed:
             # Never publish an unconfirmed / NEEDS_REVIEW event until all OCR attempts are completed!
             if len(evidence.reads) < self.settings.ocr_max_attempts:
@@ -72,7 +63,10 @@ class EventManager:
                 log.warning('passage_unreadable_flagged_for_review', extra={
                     'origin': job.origin_key, 'gate_id': job.gate_id, 'track_id': job.track_id
                 })
-        selected = max((r for r in good if r.normalized_text == best), key=lambda r: r.confidence) if confirmed else validation
+        selected = max((r for r in good if r.normalized_text == best), key=lambda r: r.confidence) if confirmed else max(
+            (r for r in evidence.reads if r),
+            key=lambda r: (r.valid_check_digit, r.valid_format, r.confidence),
+            default=validation)
         proof = proof_job or job
         obs = Observation(job.origin_key, job.gate_id, job.track_id, proof.detection, selected,
                           job.direction, proof.frame.image, job.started_at, confirmed,

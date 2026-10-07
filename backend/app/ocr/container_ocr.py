@@ -28,3 +28,14 @@ def crop_identification(image, bbox, roi=(0, 0, 1, 1)):
     if crop.size == 0:
         raise ValueError('Empty identification region')
     return crop.copy()
+
+
+def inside_gate(bbox, image_shape, zone):
+    """Require a detection's center and most of its area inside the gate ROI."""
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = bbox
+    zx1, zy1, zx2, zy2 = (zone[0]*w, zone[1]*h, zone[2]*w, zone[3]*h)
+    area = max(0, x2-x1) * max(0, y2-y1)
+    overlap = max(0, min(x2,zx2)-max(x1,zx1)) * max(0,min(y2,zy2)-max(y1,zy1))
+    return (area > 0 and zx1 <= (x1+x2)/2 <= zx2 and
+            zy1 <= (y1+y2)/2 <= zy2 and overlap/area >= .8)

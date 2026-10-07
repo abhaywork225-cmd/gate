@@ -27,7 +27,7 @@ from app.events.gate_logic import update_direction
 from app.events.occupancy import ViewOccupancy
 from app.events.passages import PassageCollector
 from app.metrics import Metrics
-from app.ocr.container_ocr import crop_identification, prepare_ocr_crop
+from app.ocr.container_ocr import crop_identification, prepare_ocr_crop, inside_gate
 from app.ocr.ocr_engine import EasyOCREngine, create_ocr_engine
 from app.ocr.validator import ContainerValidator, extract_iso_size_code
 from app.ocr.job_store import OCRJobStore
@@ -628,6 +628,8 @@ class GateRuntime:
                 self.passages.update(camera, frame, detections)
                 self._queue_passage_candidates()
             return
+        detections = [d for d in detections if inside_gate(
+            d.bbox, frame.image.shape, camera.occupancy_roi)]
         tracks = self.tracker[camera.id].update(detections, frame.timestamp)
         with self._state_lock:
             occupant = self.occupancy[camera.id]
@@ -677,6 +679,9 @@ class GateRuntime:
                 event_id = gate_event_id or getattr(occupancy, 'event_id', None) or getattr(occupancy, 'provisional_event_id', None) or str(uuid4())
                 if event_id and not getattr(occupancy, 'provisional_event_id', None):
                     occupancy.provisional_event_id = event_id
+
+                if not (active_slot_obj.stationary if active_slot_obj else occupancy.stationary):
+                    continue  # Only stopped vehicles inside the gate ROI enter OCR.
 
                 state = self._tracks.setdefault(origin, {'pending': False, 'done': False, 'last_ocr': 0., 'seen': frame.timestamp, 'samples': 0, 'last_ocr_ts': None})
                 state['seen'] = frame.timestamp
@@ -845,11 +850,19 @@ class GateRuntime:
         # OCR must not hold the YOLO/TensorRT accelerator lock.  A slow OCR
         # read otherwise starves live camera inference and lets trucks pass
         # between detector frames. The OCR engine owns its own thread safety.
-        crop = prepare_ocr_crop(crop)
+        reader = getattr(self.ocr, 'read_iso', self.ocr.read) if is_iso else self.ocr.read
+        original = reader(crop)
         if is_iso:
-            iso_reader = getattr(self.ocr, 'read_iso', self.ocr.read)
-            return iso_reader(crop)
-        return self.ocr.read(crop)
+            if extract_iso_size_code(original.raw_text)[0]:
+                return original
+        elif self.validator.validate(original).valid_check_digit:
+            return original
+        enhanced = reader(prepare_ocr_crop(crop))
+        if is_iso:
+            return enhanced if extract_iso_size_code(enhanced.raw_text)[0] else original
+        original_v, enhanced_v = self.validator.validate(original), self.validator.validate(enhanced)
+        return max([(original, original_v), (enhanced, enhanced_v)],
+                   key=lambda pair: (pair[1].valid_check_digit, pair[1].valid_format, pair[1].confidence))[0]
 
     def _process_saved_ocr(self, job_id):
         job, crop, validation = self.ocr_store.load(job_id)
@@ -904,12 +917,15 @@ class GateRuntime:
                 c_w = max(1.0, c_box[2] - c_box[0])
                 c_h = max(1.0, c_box[3] - c_box[1])
                 c_area = c_w * c_h
-                margin = 80  # margin around container bbox
+                margin = 0  # Never borrow text from a neighbouring truck.
 
                 cointainer_candidates = []
                 feet_candidates = []
 
+                job_camera = next((c for c in self.cameras if c.id == job.detection.camera_id), None)
                 for d in job.all_detections:
+                    if job_camera and not inside_gate(d.bbox, job.frame.image.shape, job_camera.occupancy_roi):
+                        continue
                     cls_name = d.class_name.lower()
                     fc_x = (d.bbox[0] + d.bbox[2]) / 2
                     fc_y = (d.bbox[1] + d.bbox[3]) / 2
@@ -979,7 +995,7 @@ class GateRuntime:
                                     validation = Validation(
                                         raw_text=f"{validation.raw_text} {f_r.raw_text}",
                                         normalized_text=validation.normalized_text,
-                                        confidence=max(validation.confidence, f_r.confidence),
+                                        confidence=validation.confidence,
                                         valid_format=validation.valid_format,
                                         valid_check_digit=validation.valid_check_digit,
                                         validation_status=validation.validation_status,
@@ -1020,7 +1036,7 @@ class GateRuntime:
                         main_val = Validation(
                             raw_text=f"{main_val.raw_text} {validation.raw_text}",
                             normalized_text=main_val.normalized_text,
-                            confidence=max(main_val.confidence, validation.confidence),
+                            confidence=main_val.confidence,
                             valid_format=main_val.valid_format,
                             valid_check_digit=main_val.valid_check_digit,
                             validation_status=main_val.validation_status,
@@ -1029,19 +1045,9 @@ class GateRuntime:
                     read = main_read
                     validation = main_val
 
-            # 3. FALLBACK TO COMPANION CAMERA FRAMES (e.g. Side or Rear cameras):
-            # If the primary camera didn't yield a valid container check digit, attempt OCR on companion camera frames
-            if validation is None or not validation.valid_check_digit:
-                companion_dict = dict(getattr(job, 'companion_frames', {}) or {})
-                for other_cam_id, comp_img in companion_dict.items():
-                    if comp_img is not None and getattr(comp_img, 'size', 0) > 0:
-                        comp_read = self._read_ocr(comp_img)
-                        comp_val = self.validator.validate(comp_read)
-                        if comp_val.valid_check_digit or (validation is None or comp_val.confidence > validation.confidence):
-                            read = comp_read
-                            validation = comp_val
-                            if validation.valid_check_digit:
-                                break
+            # Companion frames are contextual proof only. Their independent
+            # calibrated camera jobs supply OCR; a full-frame read can steal an
+            # identity from a parked or queued truck outside this visit.
 
             self.metrics.latency('ocr', time.monotonic() - started)
             self.ocr_store.save_validation(job_id, validation)
@@ -1083,9 +1089,9 @@ class GateRuntime:
                 ev = self.repository.event(result[0]) if result else None
                 if ev:
                     if getattr(job, 'slot_position', 'FRONT') == 'REAR':
-                        state['done'] = bool(ev.get('container_number_2'))
+                        state['done'] = ev.get('status') == 'CONFIRMED' and bool(ev.get('container_number_2'))
                     else:
-                        state['done'] = bool(ev.get('container_number'))
+                        state['done'] = ev.get('status') == 'CONFIRMED' and bool(ev.get('container_number'))
                 else:
                     state['done'] = False
         if result:

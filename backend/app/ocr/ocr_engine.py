@@ -64,7 +64,9 @@ def _paddle_worker(requests, responses, use_gpu: bool, detection_model: str, rec
         sys.modules['modelscope'] = types.ModuleType('modelscope')
         os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
         from paddleocr import PaddleOCR
-        device = 'gpu:0' if use_gpu and paddle.is_compiled_with_cuda() else 'cpu'
+        if use_gpu and not paddle.is_compiled_with_cuda():
+            raise RuntimeError('GPU OCR requested, but Paddle has no CUDA support')
+        device = 'gpu:0' if use_gpu else 'cpu'
         paddle.set_device(device)
         engine = PaddleOCR(
             text_detection_model_name=detection_model,
@@ -255,7 +257,9 @@ class EasyOCREngine:
         import torch
         network_dir = settings.ocr_model_directory / 'user_network'
         network_dir.mkdir(parents=True, exist_ok=True)
-        use_gpu = bool(settings.ocr_gpu and torch.cuda.is_available())
+        if settings.ocr_gpu and not torch.cuda.is_available():
+            raise RuntimeError('GPU OCR requested, but CUDA is unavailable')
+        use_gpu = bool(settings.ocr_gpu)
         self.reader = easyocr.Reader(['en'], gpu=use_gpu,
                                      model_storage_directory=str(settings.ocr_model_directory),
                                      user_network_directory=str(network_dir),
@@ -266,6 +270,66 @@ class EasyOCREngine:
         with self._lock:
             return self._do_read(image)
 
+    def _read_segmented_number(self, image):
+        """Read separately printed owner/serial/check-digit glyphs on white-text crops.
+
+        Segments come from connected components, never a guessed identity or
+        checksum-derived digit. Reject layouts that do not have all 11 glyphs.
+        """
+        import cv2
+        import numpy as np
+        from app.ocr.validator import ContainerValidator
+        h, w = image.shape[:2]
+        if not 2.5 <= w / max(h, 1) <= 15:
+            return None
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        # Both white markings on dark steel and black markings on light steel.
+        layouts = []
+        for bright in (True, False):
+            mask = ((gray > 150) if bright else (gray < 100)).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            boxes = sorted([cv2.boundingRect(c) for c in contours
+                            if .4*h <= cv2.boundingRect(c)[3] <= h
+                            and 3 <= cv2.boundingRect(c)[2] < .35*w])
+            if not 3 <= len(boxes) <= 18:
+                continue
+            splits = [(boxes[i][0] - max(x+bw for x,y,bw,bh in boxes[:i]), i)
+                      for i in range(1, len(boxes)-1)
+                      if .15*w <= max(x+bw for x,y,bw,bh in boxes[:i])-boxes[0][0] <= .55*w]
+            if not splits:
+                continue
+            gap, split = max(splits)
+            if gap < .03*w:
+                continue
+            layouts.append((boxes[:split], boxes[split:-1], boxes[-1:]))
+        for owner, serial, digit in layouts:
+            read = self._recognize_number_segments(image, owner, serial, digit)
+            if read:
+                return read
+        return None
+
+    def _recognize_number_segments(self, image, owner, serial, digit):
+        import numpy as np
+        from app.ocr.validator import ContainerValidator
+        h, w = image.shape[:2]
+        pieces = []
+        for group, allowed, length in [(owner, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 4),
+                                       (serial, '0123456789', 6), (digit, '0123456789', 1)]:
+            x1 = min(b[0] for b in group); y1 = min(b[1] for b in group)
+            x2 = max(b[0]+b[2] for b in group); y2 = max(b[1]+b[3] for b in group)
+            if length == 1 and group[0][2] > np.median([b[3] for b in serial])*.5:
+                # Remove a printed rectangle around the actual check digit.
+                dx, dy = max(2, int((x2-x1)*.15)), max(2, int((y2-y1)*.15))
+                x1 += dx; x2 -= dx; y1 += dy; y2 -= dy
+            part = image[max(0,y1-2):min(h,y2+2), max(0,x1-2):min(w,x2+2)]
+            items = self.reader.recognize(part, detail=1, allowlist=allowed)
+            text = ''.join(str(item[1]) for item in items).replace(' ', '')
+            if len(text) != length:
+                return None
+            pieces.append((text, min(float(item[2]) for item in items)))
+        read = OCRRead(' '.join(p[0] for p in pieces), min(p[1] for p in pieces))
+        return read if ContainerValidator().validate(read).valid_check_digit else None
+
     def _do_read(self, image) -> OCRRead:
         import re
         import cv2
@@ -275,6 +339,9 @@ class EasyOCREngine:
         if image is None or getattr(image, 'size', 0) == 0:
             return OCRRead('', 0.0)
 
+        segmented = self._read_segmented_number(image)
+        if segmented:
+            return segmented
         h, w = image.shape[:2]
         # Avoid processing massive full 4K/1080p crops without downscaling
         proc_img = image
@@ -304,7 +371,7 @@ class EasyOCREngine:
             return OCRRead(txt, conf)
 
         # If not vertical and no valid code found yet, check vertical post strips
-        if not is_vertical and w > 200:
+        if not is_vertical and w > 200 and h > 200 and w / h < 2.5:
             strips = [
                 proc_img[:, int(w * 0.60):],
                 proc_img[int(h * 0.08):int(h * 0.90), int(w * 0.35):int(w * 0.80)]

@@ -11,6 +11,7 @@ import { GateEvent } from './gate-api.service';
     <th>Lane</th>
     <th>Movement</th>
     <th>Status</th>
+    <th>Site Sync</th>
     <th>Evidence & Actions</th>
   </tr></thead>
   <tbody>@for (event of visibleEvents(); track event.id) {<tr>
@@ -25,7 +26,8 @@ import { GateEvent } from './gate-api.service';
           </div>
         </div>
       } @else {
-        {{ event.container_number || 'Unread / unconfirmed' }}
+        {{ event.container_number || event.candidate_number || 'Unread / unconfirmed' }}
+        @if (!event.container_number && event.candidate_number) { <small>Unverified</small> }
       }
     </td>
     <td>
@@ -46,6 +48,15 @@ import { GateEvent } from './gate-api.service';
     <td><span class="badge movement-badge">{{ event.event_type }}</span></td>
     <td><span class="badge" [class.good]="event.status === 'CONFIRMED'" [class.warn]="event.status === 'NEEDS_REVIEW'">{{ event.status.replaceAll('_', ' ') }}</span></td>
     <td>
+      @if (event.cloud_synced) {
+        <span class="badge good cloud-badge">✓ Synced</span>
+      } @else if (event.status === 'CONFIRMED') {
+        <span class="badge paused cloud-badge">⏸ Paused</span>
+      } @else {
+        <span class="subtle-dash">—</span>
+      }
+    </td>
+    <td>
       <div class="action-cell">
         <button class="view-event-btn" (click)="selected.emit(event.id)">View event →</button>
         <a class="json-badge-link" [href]="'/api/gate-events/' + event.id + '/json'" [download]="'event_' + (event.container_number || event.id) + '.json'" title="Download event.json">
@@ -53,7 +64,7 @@ import { GateEvent } from './gate-api.service';
         </a>
       </div>
     </td>
-  </tr>} @empty {<tr><td colspan="7" class="empty">No events match this view. Events appear after sufficient detection and OCR evidence.</td></tr>}</tbody></table></div>`
+  </tr>} @empty {<tr><td colspan="8" class="empty">No events match this view. Events appear after sufficient detection and OCR evidence.</td></tr>}</tbody></table></div>`
 })
 export class EventTableComponent {
   events = input<GateEvent[]>([]);

@@ -131,13 +131,52 @@ class SnapshotManager:
         captures = []
         for items in by_camera.values():
             preferred = [item for item in items if item.get('id') in preferred_ids]
-            captures.append(preferred[0] if preferred else max(
-                items, key=lambda item: (item['quality_score'], item.get('timestamp') or '')
-            ))
+            if preferred:
+                captures.extend(preferred)
+            else:
+                captures.append(max(
+                    items, key=lambda item: (item['quality_score'], item.get('timestamp') or '')
+                ))
+
+        # Ensure all explicitly designated proof snapshots are included
+        existing_ids = {c['id'] for c in captures}
+        for snap in snapshots:
+            if snap.get('id') in preferred_ids and snap.get('id') not in existing_ids:
+                captures.append(snap)
+                existing_ids.add(snap['id'])
+
         captures.sort(key=lambda item: (item.get('camera_id') or '', item.get('timestamp') or ''))
         ids = {item['id'] for item in captures}
-        primary = event_record.get('primary_snapshot_id') if event_record.get('primary_snapshot_id') in ids else (captures[0]['id'] if captures else None)
-        rear = event_record.get('rear_snapshot_id') if event_record.get('rear_snapshot_id') in ids else next((item['id'] for item in captures if (item.get('image_path') or '').endswith('_rear.jpg')), None)
+
+        # Resolve primary (front) proof snapshot
+        front_cands = [c for c in captures if not (c.get('image_path') or '').endswith('_rear.jpg')]
+        if event_record.get('primary_snapshot_id') in ids:
+            primary = event_record.get('primary_snapshot_id')
+        elif front_cands:
+            primary = front_cands[0]['id']
+        elif captures:
+            primary = captures[0]['id']
+        else:
+            primary = None
+
+        # Resolve rear proof snapshot
+        is_twin = bool(event_record.get('is_twin'))
+        rear_cands = [c for c in captures if (c.get('image_path') or '').endswith('_rear.jpg') or any(k in (c.get('camera_id') or '').lower() for k in ('-3', 'rear'))]
+        if event_record.get('rear_snapshot_id') in ids:
+            rear = event_record.get('rear_snapshot_id')
+        elif rear_cands:
+            rear = rear_cands[0]['id']
+        elif is_twin and len(captures) > 1:
+            rear = next((c['id'] for c in captures if c['id'] != primary), None)
+        else:
+            rear = None
+
+        # Ensure twin events have distinct snapshots for front and rear when multiple captures exist
+        if is_twin and primary and rear and primary == rear and len(captures) > 1:
+            diff_cand = next((c['id'] for c in captures if c['id'] != primary), None)
+            if diff_cand:
+                rear = diff_cand
+
         return {'version': 1, 'event_id': event_record.get('id'), 'captures': captures,
                 'selected_snapshot_ids': [item['id'] for item in captures],
                 'primary_snapshot_id': primary, 'rear_snapshot_id': rear}

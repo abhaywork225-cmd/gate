@@ -64,3 +64,14 @@ def test_clipped_identification_crop():
     assert crop_identification(image, (-30, -10, 250, 150), (.5, .5, 1, 1)).shape == (50, 100, 3)
     with pytest.raises(ValueError):
         crop_identification(image, (300, 100, 350, 120))
+
+
+def test_legitimate_vertical_number_is_not_discarded(settings, make_job):
+    class Box:
+        cls = np.array(0)
+        conf = np.array(.92)
+        xyxy = np.array([[10, 5, 45, 95]])
+    class Model:
+        def predict(self, **kwargs):
+            return [SimpleNamespace(names={0:'container_number'}, boxes=[Box()])]
+    assert len(YoloDetector(settings, Model()).detect(make_job().frame)) == 1

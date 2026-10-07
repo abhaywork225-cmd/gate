@@ -16,6 +16,7 @@ from app.events.cloud_dispatcher import CloudOutboxDispatcher, ProsperSession
 def mock_settings(settings):
     cfg = settings.model_copy(update={
         'prosper_enabled': True,
+        'prosper_auto_dispatch': True,
         'prosper_api_base_url': 'http://syapi.test.prosper.com',
         'prosper_site_id': 'site-uuid-1234',
         'prosper_bearer_token': SecretStr('test-bearer-token'),
@@ -81,7 +82,7 @@ def test_prosper_session_post_gate_event(mock_settings):
         'id': 'event-1',
         'gateId': 'gate-lane-1',
         'timestamp': '2026-09-09T12:00:00.000Z',
-        'containerNumber': 'MSKU1234567',
+        'containerNumber': 'CSQU3054383',
         'eventType': 'ENTRY',
         'deviceId': 'device-uuid-1',
         'confidence': 0.95,
@@ -160,7 +161,7 @@ def test_cloud_dispatcher_enqueue_and_sync(mock_settings):
         confidence=0.95,
         bbox=(10.0, 10.0, 50.0, 50.0),
     )
-    val = Validation(raw_text='MSKU 123456-7', normalized_text='MSKU1234567',
+    val = Validation(raw_text='CSQU 305438-3', normalized_text='CSQU3054383',
                      confidence=0.95, valid_format=True, valid_check_digit=True,
                      validation_status='VALID')
     obs = Observation('origin-1', 'gate-lane-1', 1, det, val, 'ENTRY', dummy_img, utcnow(), confirmed=True)
@@ -182,7 +183,7 @@ def test_cloud_dispatcher_enqueue_and_sync(mock_settings):
         assert mock_post.called
         call_payload = mock_post.call_args[0][0]
         assert call_payload['id'] == 'evt-uuid-123'
-        assert call_payload['containerNumber'] == 'MSKU1234567'
+        assert call_payload['containerNumber'] == 'CSQU3054383'
         assert call_payload['EventType'] in ('GATE_IN', 'GATE_OUT')
         assert metrics.increment.called
 
@@ -197,7 +198,7 @@ def test_syapi_gate_event_schema(mock_settings):
         confidence=0.96,
         bbox=(5.0, 5.0, 25.0, 25.0),
     )
-    val = Validation(raw_text='MSCU 111111 1', normalized_text='MSCU1111111',
+    val = Validation(raw_text='MSCU 663987 0', normalized_text='MSCU6639870',
                      confidence=0.96, valid_format=True, valid_check_digit=True,
                      validation_status='VALID', size_type='22G1')
     obs = Observation('origin-syapi', 'LANE-1', 10, det, val, 'ENTRY', dummy_img, utcnow(), confirmed=True)
@@ -222,7 +223,7 @@ def test_syapi_gate_event_schema(mock_settings):
         assert payload['Driver'] is None
         assert len(payload['Containers']) == 1
         container = payload['Containers'][0]
-        assert container['ContainerNumber'] == 'MSCU1111111'
+        assert container['ContainerNumber'] == 'MSCU6639870'
         assert container['ContainerNumberConfidence'] == 0.96
         assert container['Size'] == '20'
         assert container['Position'] == 'SINGLE'
@@ -265,6 +266,10 @@ def test_each_camera_sends_one_image_without_duplicate_views(mock_settings, tmp_
         'id': 'evt-123',
         'status': 'CONFIRMED',
         'container_number': 'BSIU3391518',
+        'ocr_results': [{'raw_text': 'BSIU3391518', 'normalized_text': 'BSIU3391518', 'valid_check_digit': True, 'confidence': .91, 'detection_id': 'det-main'}],
+        'detections': [{'id': 'det-main', 'camera_id': 'gate-in-1', 'timestamp': '2026-09-30T10:00:00Z'},
+                       {'id': 'det-side', 'camera_id': 'gate-in-2', 'timestamp': '2026-09-30T10:00:01Z'},
+                       {'id': 'det-rear', 'camera_id': 'gate-in-3', 'timestamp': '2026-09-30T10:00:03Z'}],
         'container_number_2': None,
         'is_twin': 0,
         'iso_code_1': '22G1',

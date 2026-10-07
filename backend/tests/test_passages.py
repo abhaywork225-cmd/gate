@@ -125,6 +125,7 @@ def test_runtime_keeps_passage_open_until_clear_and_confirms_two_slots(settings,
                 Detection('camera-1',frame.timestamp,'container_number',.9,(20,30,65,45)),
                 Detection('camera-1',frame.timestamp,'container_number',.9,(120,30,165,45))]
     runtime.detector=Detector()
+    runtime.model_status['detector'] = 'READY'
     frame=replace(make_job().frame,image=np.random.default_rng(2).integers(0,255,(100,200,3),dtype=np.uint8))
     for sequence in (1,2):
         runtime.process_frame(camera,replace(frame,sequence=sequence,timestamp=frame.timestamp+timedelta(seconds=sequence)))

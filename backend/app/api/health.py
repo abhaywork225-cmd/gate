@@ -55,6 +55,36 @@ def retry_cloud_sync(request: Request):
     return {'triggered': False, 'pending': 0}
 
 
+@router.post('/cloud-sync/pause')
+def pause_cloud_sync(request: Request):
+    runtime = request.app.state.runtime
+    if hasattr(runtime, 'dispatcher') and runtime.dispatcher:
+        runtime.dispatcher.pause()
+        return {'paused': True, 'auto_dispatch': False}
+    return {'paused': True, 'auto_dispatch': False}
+
+
+@router.post('/cloud-sync/resume')
+def resume_cloud_sync(request: Request):
+    runtime = request.app.state.runtime
+    if hasattr(runtime, 'dispatcher') and runtime.dispatcher:
+        runtime.dispatcher.resume()
+        return {'paused': False, 'auto_dispatch': True}
+    return {'paused': False, 'auto_dispatch': True}
+
+
+@router.post('/cloud-sync/toggle-auto-dispatch')
+def toggle_auto_dispatch(request: Request):
+    runtime = request.app.state.runtime
+    if hasattr(runtime, 'dispatcher') and runtime.dispatcher:
+        if runtime.dispatcher.auto_dispatch:
+            runtime.dispatcher.pause()
+        else:
+            runtime.dispatcher.resume()
+        return {'auto_dispatch': runtime.dispatcher.auto_dispatch, 'is_paused': not runtime.dispatcher.auto_dispatch}
+    return {'auto_dispatch': False, 'is_paused': True}
+
+
 @router.get('/models')
 def models(request: Request):
     runtime = request.app.state.runtime

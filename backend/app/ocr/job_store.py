@@ -17,7 +17,8 @@ import sqlite3
 import time
 from uuid import uuid4
 
-from app.domain import Detection, Frame, Validation
+from app.domain import Detection, Frame, Validation, OCRRead
+from app.ocr.validator import ContainerValidator
 
 
 class OCRJobStore:
@@ -309,7 +310,8 @@ class OCRJobStore:
             meta = json.loads(row['metadata']) if row['metadata'] else {}
             val = json.loads(row['validation']) if row['validation'] else {}
             q = float(meta.get('proof_quality', 0))
-            if val.get('valid_check_digit'):
+            checked = ContainerValidator().validate(OCRRead(val.get('raw_text', ''), val.get('confidence', 0)))
+            if checked.valid_check_digit:
                 q += 1000.0 + (float(val.get('confidence', 0)) * 100.0)
             return q
 
@@ -363,7 +365,10 @@ class OCRJobStore:
             rows = db.execute("SELECT * FROM jobs WHERE origin=? AND state='DONE' ORDER BY id DESC LIMIT ?",
                               (origin, limit)).fetchall()
         rows = list(reversed(rows))
-        return Evidence(reads=[Validation(**json.loads(row['validation'])) for row in rows if row['validation']],
+        return Evidence(reads=[ContainerValidator().validate(OCRRead(
+                            json.loads(row['validation']).get('raw_text', ''),
+                            json.loads(row['validation']).get('confidence', 0)))
+                        for row in rows if row['validation']],
                         event_id=next((row['event_id'] for row in rows if row['event_id']), None),
                         last_sequence=rows[-1]['sequence'] if rows else None)
 
