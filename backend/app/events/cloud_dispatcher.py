@@ -638,7 +638,8 @@ class CloudOutboxDispatcher:
             if not by_camera:
                 raise ValueError('Final capture has no retained source proof')
             position = ('FRONT' if index==0 else 'REAR') if event.get('is_twin') else 'SINGLE'
-            images = [{'ImageType':position,'CameraId':snap['camera_id'],'CapturedAt':snap['timestamp'],
+            img_type = 'REAR' if index == 1 else 'FRONT'
+            images = [{'ImageType':img_type,'CameraId':snap['camera_id'],'CapturedAt':snap['timestamp'],
                        'Image':'data:image/jpeg;base64,'+base64.b64encode(data).decode()}
                       for _,snap,data in by_camera.values()]
             matching = [o for o in event.get('ocr_results',[]) if number and o.get('normalized_text')==number]
@@ -795,10 +796,6 @@ class CloudOutboxDispatcher:
                     c = (c_id or '').lower()
                     if any(k in c for k in ('3', 'rear', 'back')):
                         return 'REAR'
-                    if any(k in c for k in ('2', 'left', 'side')):
-                        return 'LEFT'
-                    if 'right' in c:
-                        return 'RIGHT'
                     return 'FRONT'
 
                 for cam_id in sorted(best_by_camera.keys(), key=_cam_sort_key):
