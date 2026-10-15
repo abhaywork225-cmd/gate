@@ -119,7 +119,13 @@ class ProsperSession:
 
     def __init__(self, settings):
         self.settings = settings
-        self.base_url = settings.prosper_api_base_url.rstrip('/')
+        base = settings.prosper_api_base_url.rstrip('/')
+        if base.endswith('/api/v1/gate/events'):
+            self.events_url = base
+            self.base_url = base[:-len('/api/v1/gate/events')].rstrip('/')
+        else:
+            self.base_url = base
+            self.events_url = f'{self.base_url}/api/v1/gate/events'
         self.auth_url = getattr(settings, 'prosper_auth_url', None) or 'https://cfsapi.prosperassettracking.com/api/auth/login'
         self.site_id = (settings.prosper_site_id or '').strip()
         self.client_id = (getattr(settings, 'prosper_client_id', None) or '').strip()
@@ -288,7 +294,7 @@ class ProsperSession:
 
         # Check whether this is the new /api/v1/gate/events schema or legacy /api/sites/{site_id}/gate-events
         if 'VisitId' in payload or 'Containers' in payload:
-            url = f'{self.base_url}/api/v1/gate/events'
+            url = getattr(self, 'events_url', f'{self.base_url}/api/v1/gate/events')
         else:
             if not self.site_id:
                 log.warning('prosper_sync_skipped_missing_site_id')

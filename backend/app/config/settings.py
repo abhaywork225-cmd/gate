@@ -166,7 +166,7 @@ class Settings(BaseSettings):
     max_frame_width: int = Field(default=1920, ge=320, le=4096)
     prosper_enabled: bool = False
     prosper_auto_dispatch: bool = False
-    prosper_api_base_url: str = 'https://syapi.prosperassettracking.com'
+    prosper_api_base_url: str = 'https://api.smartyard.prosperinfotech.com/gate/api/v1/gate/events'
     prosper_auth_url: str = 'https://cfsapi.prosperassettracking.com/api/auth/login'
     prosper_site_id: str = ''
     prosper_client_id: str = ''
