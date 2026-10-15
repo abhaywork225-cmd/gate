@@ -36,6 +36,24 @@ class TextErrorFormatter(logging.Formatter):
         return msg
 
 
+class CloudDispatchFormatter(logging.Formatter):
+    def format(self, record):
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        details = []
+        for k in ('event_id', 'visit_id', 'status_code', 'duration_ms', 'cloud_event_id'):
+            if hasattr(record, k) and getattr(record, k) is not None:
+                details.append(f"{k}={getattr(record, k)}")
+        details_str = f" [{', '.join(details)}]" if details else ""
+        msg = f"[{timestamp}] [{record.levelname}] [{record.name}]{details_str} {record.getMessage()}"
+        if hasattr(record, 'audit_data') and record.audit_data:
+            try:
+                formatted_audit = json.dumps(record.audit_data, indent=2)
+                msg += f"\n--- DISPATCH AUDIT ---\n{formatted_audit}\n----------------------"
+            except Exception:
+                pass
+        return msg
+
+
 def _add_file_handler(logger, filepath: Path, level: int, formatter: logging.Formatter, max_bytes=10 * 1024 * 1024, backup_count=5):
     resolved = str(filepath.resolve())
     for h in logger.handlers:
@@ -82,3 +100,9 @@ def configure_logging(log_dir: Path | str = "logs"):
 
     pipe_logger = logging.getLogger('gate.pipeline')
     _add_file_handler(pipe_logger, log_path / "pipeline_errors.log", logging.WARNING, text_fmt)
+
+    # Cloud dispatch audit logger
+    cloud_audit_logger = logging.getLogger('gate.cloud.audit')
+    cloud_audit_logger.setLevel(logging.INFO)
+    _add_file_handler(cloud_audit_logger, log_path / "cloud_dispatch.log", logging.INFO, CloudDispatchFormatter())
+

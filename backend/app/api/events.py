@@ -75,6 +75,22 @@ def dispatch_cloud_event(event_id: str, request: Request):
     return result
 
 
+@router.get('/gate-events/{event_id}/cloud-logs')
+def event_cloud_logs(event_id: str, request: Request):
+    repo = request.app.state.repository
+    if hasattr(repo, 'get_cloud_dispatch_logs'):
+        return repo.get_cloud_dispatch_logs(event_id=event_id)
+    return []
+
+
+@router.get('/cloud-dispatch-logs')
+def cloud_dispatch_logs(request: Request, event_id: str | None = None, limit: int = Query(50, ge=1, le=200)):
+    repo = request.app.state.repository
+    if hasattr(repo, 'get_cloud_dispatch_logs'):
+        return repo.get_cloud_dispatch_logs(event_id=event_id, limit=limit)
+    return []
+
+
 @router.get('/ocr-crops/{job_id}')
 def ocr_crop(job_id: int, request: Request):
     path = request.app.state.runtime.ocr_store.crop_path(job_id)

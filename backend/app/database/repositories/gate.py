@@ -1303,6 +1303,30 @@ class GateRepository:
             )
             return int(session.scalar(query) or 0)
 
+    def log_system_event(self, event_name: str, level: str = 'INFO', event_id: str | None = None, context: dict | None = None):
+        """Append an audit or event record to system_logs."""
+        try:
+            with self._write_lock, self.db.sessions.begin() as session:
+                session.add(SystemLog(
+                    id=str(uuid4()),
+                    event_id=event_id,
+                    level=level,
+                    event_name=event_name,
+                    context=context or {}
+                ))
+        except Exception:
+            pass
+
+    def get_cloud_dispatch_logs(self, event_id: str | None = None, limit: int = 50):
+        """Query cloud dispatch audit records."""
+        with self.db.sessions() as session:
+            stmt = select(SystemLog).where(SystemLog.event_name == 'cloud_dispatch_audit')
+            if event_id:
+                stmt = stmt.where(SystemLog.event_id == event_id)
+            stmt = stmt.order_by(SystemLog.timestamp.desc()).limit(limit)
+            rows = session.execute(stmt).scalars().all()
+            return [serialize(row) for row in rows]
+
     def clean_duplicate_events(self, max_gap_seconds: int = 1200, snapshots=None):
         """
         Merges and removes duplicate events created for the same container within dwell windows.

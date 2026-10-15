@@ -114,11 +114,51 @@ def detection_confidence(event, observation, number):
     return max(scores, default=0.0)
 
 
+def sanitize_payload_for_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {'raw': str(payload)}
+    sanitized = {}
+    for k, v in payload.items():
+        if k == 'Containers' and isinstance(v, list):
+            containers_sanitized = []
+            for c in v:
+                if not isinstance(c, dict):
+                    containers_sanitized.append(c)
+                    continue
+                c_copy = {}
+                for ck, cv in c.items():
+                    if ck == 'Images' and isinstance(cv, list):
+                        images_summary = []
+                        for img in cv:
+                            if isinstance(img, dict):
+                                img_copy = {ik: iv for ik, iv in img.items() if ik != 'Image'}
+                                raw_img = img.get('Image')
+                                if isinstance(raw_img, (str, bytes)):
+                                    img_copy['image_bytes_len'] = len(raw_img)
+                                    if isinstance(raw_img, str) and ',' in raw_img:
+                                        img_copy['image_format'] = raw_img.split(',', 1)[0]
+                                images_summary.append(img_copy)
+                            else:
+                                images_summary.append(str(img))
+                        c_copy['Images'] = images_summary
+                    else:
+                        c_copy[ck] = cv
+                containers_sanitized.append(c_copy)
+            sanitized['Containers'] = containers_sanitized
+        elif k in ('Image', 'imagePath', 'imageUrl') and isinstance(v, str) and len(v) > 200:
+            sanitized[k] = f"<data len={len(v)}>"
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
 class ProsperSession:
     """Manages authentication tokens and HTTP requests to Prosper Smart Yard."""
 
-    def __init__(self, settings):
+    def __init__(self, settings, audit_callback: Optional[Any] = None):
         self.settings = settings
+        self.audit_callback = audit_callback
+        self.last_dispatch_audit: Optional[Dict[str, Any]] = None
         base = settings.prosper_api_base_url.rstrip('/')
         if base.endswith('/api/v1/gate/events'):
             self.events_url = base
@@ -283,11 +323,60 @@ class ProsperSession:
 
         return None
 
+    def _record_audit(self, payload: Dict[str, Any], url: str, status_code: Optional[int],
+                      response_data: Any, duration_ms: float, status_label: str, error_msg: Optional[str] = None):
+        cloud_event_id = None
+        visit_database_id = None
+        if isinstance(response_data, dict):
+            cloud_event_id = response_data.get('eventId') or response_data.get('id')
+            visit_database_id = response_data.get('visitDatabaseId')
+        event_id = payload.get('id') or payload.get('VisitId')
+        visit_id = payload.get('VisitId')
+
+        audit_entry = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'event_id': event_id,
+            'visit_id': visit_id,
+            'event_sent': sanitize_payload_for_audit(payload),
+            'api_endpoint': url,
+            'status_code': status_code,
+            'api_response': response_data,
+            'cloud_event_id': cloud_event_id,
+            'visit_database_id': visit_database_id,
+            'duration_ms': duration_ms,
+            'status': status_label,
+            'error': error_msg,
+        }
+        self.last_dispatch_audit = audit_entry
+
+        audit_log = logging.getLogger('gate.cloud.audit')
+        extra = {
+            'event_id': event_id,
+            'visit_id': visit_id,
+            'status_code': status_code,
+            'duration_ms': duration_ms,
+            'cloud_event_id': cloud_event_id,
+            'audit_data': audit_entry,
+        }
+        summary_msg = f"Cloud dispatch to {url} - Status {status_code} ({status_label}) in {duration_ms}ms"
+        if status_code in (200, 201):
+            audit_log.info(summary_msg, extra=extra)
+        else:
+            audit_log.warning(summary_msg, extra=extra)
+
+        if self.audit_callback:
+            try:
+                self.audit_callback(audit_entry)
+            except Exception as e:
+                log.warning('prosper_audit_callback_failed', extra={'error': str(e)})
+
     def post_gate_event(self, payload: Dict[str, Any]) -> bool | str:
         """Send Gate Event to Prosper Smart Yard."""
         headers = self.get_auth_headers()
         if 'Authorization' not in headers and 'x-api-key' not in headers:
             log.info('prosper_gate_event_postponed_no_auth: Cloud authentication is not available (waiting for valid credentials or token). Dispatch buffered locally.')
+            self._record_audit(payload, getattr(self, 'events_url', self.base_url), None,
+                               'Cloud authentication unavailable', 0.0, 'OFFLINE', 'No auth credentials or token available')
             return 'OFFLINE'
 
         headers['Content-Type'] = 'application/json'
@@ -298,26 +387,40 @@ class ProsperSession:
         else:
             if not self.site_id:
                 log.warning('prosper_sync_skipped_missing_site_id')
+                self._record_audit(payload, f'{self.base_url}/api/sites/UNKNOWN/gate-events', None,
+                                   'Missing site_id', 0.0, 'REJECTED', 'Missing site_id')
                 return 'REJECTED'
             url = f'{self.base_url}/api/sites/{self.site_id}/gate-events'
 
+        start_time = time.monotonic()
         try:
             res = self.session.post(url, json=payload, headers=headers, timeout=15)
+            duration_ms = round((time.monotonic() - start_time) * 1000, 2)
         except requests.exceptions.RequestException as e:
+            duration_ms = round((time.monotonic() - start_time) * 1000, 2)
             log.info('prosper_gate_event_network_offline: %s. Dispatch buffered locally in database.', e)
+            self._record_audit(payload, url, None, str(e), duration_ms, 'OFFLINE', str(e))
             return 'OFFLINE'
         except Exception as e:
+            duration_ms = round((time.monotonic() - start_time) * 1000, 2)
             log.warning('prosper_gate_event_post_exception: %s', e)
+            self._record_audit(payload, url, None, str(e), duration_ms, 'OFFLINE', str(e))
             return 'OFFLINE'
 
+        # Parse response body
+        try:
+            resp_body = res.json() if res.content else {}
+        except Exception:
+            resp_body = res.text[:2000]
+
         if res.status_code in (200, 201):
-            resp_data = res.json() if res.content else {}
+            resp_data = resp_body if isinstance(resp_body, dict) else {}
             log.info('prosper_gate_event_synced', extra={
                 'event_id': payload.get('VisitId') or payload.get('id'),
                 'visit_db_id': resp_data.get('visitDatabaseId', ''),
                 'cloud_event_id': resp_data.get('eventId', ''),
             })
-            # Return response data so caller can extract visitDatabaseId for GATE_OUT
+            self._record_audit(payload, url, res.status_code, resp_body, duration_ms, 'SYNCED')
             return resp_data if resp_data else True
         if res.status_code == 401:
             # 401 Unauthorized: token expired or rejected by cloud
@@ -327,19 +430,16 @@ class ProsperSession:
                 self._token = None
                 self._token_expires_at = 0.0
                 self._force_dynamic_auth = True
+            self._record_audit(payload, url, res.status_code, resp_body, duration_ms, 'OFFLINE', 'Unauthorized 401')
             return 'OFFLINE'
         if res.status_code == 409:
             # 409 Conflict: E.g., "Unknown visit for GATE_OUT."
-            # The cloud requires a prior GATE_IN visit before GATE_OUT can be processed.
-            # Mark as non-retryable to avoid continuous failed loops on test/orphan exits.
             log.warning('prosper_gate_event_conflict_skipped: %s %s', res.status_code, res.text[:300],
                         extra={'status_code': res.status_code, 'body': res.text[:300]})
+            self._record_audit(payload, url, res.status_code, resp_body, duration_ms, 'CONFLICT', 'Conflict 409')
             return 'CONFLICT'
         if res.status_code in (500, 502, 503, 504):
             body_text = res.text[:400].strip()
-            # Detect known Prosper API server-side bugs:
-            # - DbUpdateConcurrencyException: optimistic concurrency failure on visits table (GATE_OUT bug)
-            # - ck_departure: check constraint violation when GATE_IN has no corresponding visit
             if 'DbUpdateConcurrencyException' in body_text:
                 event_type = payload.get('EventType', '')
                 log.warning(
@@ -358,14 +458,17 @@ class ProsperSession:
             else:
                 log.info('prosper_gate_event_cloud_service_unavailable: HTTP %s (%s). Dispatch buffered locally in database.',
                          res.status_code, body_text[:200])
+            self._record_audit(payload, url, res.status_code, resp_body, duration_ms, 'OFFLINE', f'Server error {res.status_code}')
             return 'OFFLINE'
         if res.status_code in (400, 422):
             log.warning('prosper_gate_event_rejected: %s %s', res.status_code, res.text[:300],
                         extra={'status_code': res.status_code, 'body': res.text[:300]})
+            self._record_audit(payload, url, res.status_code, resp_body, duration_ms, 'REJECTED', f'Rejected {res.status_code}')
             return 'REJECTED'
 
         log.warning('prosper_gate_event_failed: %s %s', res.status_code, res.text[:300],
                     extra={'status_code': res.status_code, 'body': res.text[:300]})
+        self._record_audit(payload, url, res.status_code, resp_body, duration_ms, 'FAILED', f'Failed {res.status_code}')
         return False
 
 
@@ -383,7 +486,7 @@ class CloudOutboxDispatcher:
         self.runtime = runtime
         self.enabled = bool(settings.prosper_enabled)
         self.auto_dispatch: bool = bool(getattr(settings, 'prosper_auto_dispatch', False))
-        self.session = ProsperSession(settings) if self.enabled else None
+        self.session = ProsperSession(settings, audit_callback=self._on_dispatch_audit) if self.enabled else None
         self.queue: Queue = Queue(maxsize=settings.prosper_queue_size)
         self._stop = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -396,6 +499,24 @@ class CloudOutboxDispatcher:
             settings.prosper_device_uuid
             or 'EDGE-GATE-01'
         )
+
+    def _on_dispatch_audit(self, audit_entry: Dict[str, Any]):
+        """Persist dispatch audit entry to system_logs database table."""
+        if not self.repository:
+            return
+        try:
+            event_id = audit_entry.get('event_id')
+            status_code = audit_entry.get('status_code')
+            level = 'INFO' if status_code in (200, 201) else ('WARN' if status_code in (409, 500, 502, 503, 504) else 'ERROR')
+            if hasattr(self.repository, 'log_system_event'):
+                self.repository.log_system_event(
+                    event_name='cloud_dispatch_audit',
+                    level=level,
+                    event_id=event_id,
+                    context=audit_entry
+                )
+        except Exception as e:
+            log.warning('prosper_audit_persistence_error', extra={'error': str(e)})
 
     def pause(self):
         """Pause automatic background dispatch to remote cloud site."""
@@ -466,11 +587,11 @@ class CloudOutboxDispatcher:
             log.info('prosper_event_held_auto_dispatch_paused', extra={'event_id': event_id})
             return
 
-        # Do not re-enqueue if already synced in database
+        # Do not re-enqueue if already synced in database or not confirmed
         if self.repository:
             try:
                 ev = self.repository.event(event_id)
-                if ev and ev.get('cloud_synced'):
+                if ev and (ev.get('cloud_synced') or ev.get('status') != 'CONFIRMED' or not ev.get('container_number')):
                     return
                 canonical = self.repository.canonical_event_id(event_id)
                 if canonical and canonical != event_id:
@@ -1101,7 +1222,7 @@ class CloudOutboxDispatcher:
                 # the same persistent identity guard here as enqueue().
                 if self.repository:
                     current = self.repository.event(event_id)
-                    if current and (current.get('cloud_synced') or (current.get('status') != 'CONFIRMED' and current.get('capture_policy') not in ('BEST_AVAILABLE','FINAL_CAPTURE','UNREADABLE_CAPTURE'))):
+                    if current and (current.get('cloud_synced') or current.get('status') != 'CONFIRMED' or not current.get('container_number')):
                         self.queue.task_done()
                         continue
                     canonical = self.repository.canonical_event_id(event_id)

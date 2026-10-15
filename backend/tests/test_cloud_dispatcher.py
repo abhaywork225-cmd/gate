@@ -309,3 +309,46 @@ def test_each_camera_sends_one_image_without_duplicate_views(mock_settings, tmp_
         assert camera_ids == ['gate-in-1']
         assert [img['ImageType'] for img in container['Images']] == ['FRONT']
 
+
+def test_dispatch_audit_logging(mock_settings):
+    audit_calls = []
+    session = ProsperSession(mock_settings, audit_callback=lambda entry: audit_calls.append(entry))
+
+    payload = {
+        'id': 'evt-audit-1',
+        'VisitId': 'VISIT-evt-audit-1',
+        'EventType': 'GATE_OUT',
+        'containerNumber': 'CSQU3054383',
+        'Containers': [
+            {
+                'ContainerNumber': 'CSQU3054383',
+                'Position': 'SINGLE',
+                'Images': [
+                    {'ImageType': 'FRONT', 'CameraId': 'cam-1', 'CapturedAt': '2026-10-15T12:00:00Z', 'Image': 'data:image/jpeg;base64,1234567890'}
+                ]
+            }
+        ]
+    }
+
+    with patch.object(session.session, 'post') as mock_post:
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.content = b'{"eventId": "cloud-ev-999", "visitDatabaseId": "v-888"}'
+        mock_post.return_value.json.return_value = {'eventId': 'cloud-ev-999', 'visitDatabaseId': 'v-888'}
+
+        res = session.post_gate_event(payload)
+        assert res == {'eventId': 'cloud-ev-999', 'visitDatabaseId': 'v-888'}
+        assert len(audit_calls) == 1
+
+        entry = audit_calls[0]
+        assert entry['event_id'] == 'evt-audit-1'
+        assert entry['visit_id'] == 'VISIT-evt-audit-1'
+        assert entry['status_code'] == 200
+        assert entry['status'] == 'SYNCED'
+        assert entry['cloud_event_id'] == 'cloud-ev-999'
+        assert entry['visit_database_id'] == 'v-888'
+        assert entry['api_response'] == {'eventId': 'cloud-ev-999', 'visitDatabaseId': 'v-888'}
+        # Image base64 must be sanitized and not stored raw
+        assert 'Image' not in entry['event_sent']['Containers'][0]['Images'][0]
+        assert entry['event_sent']['Containers'][0]['Images'][0]['image_bytes_len'] > 0
+
+
