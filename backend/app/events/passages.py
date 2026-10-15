@@ -595,7 +595,7 @@ def final_captures(group, confirmations):
     # If the only evidence is unreadable, keep one source per camera for a
     # concurrent visit. If known identities coexist, unreadable text on the same
     # passage is evidence of the container, not an additional container.
-    unknown_bundles = [unknown] if (not numbers and unknown) else []
+    unknown_bundles = [unknown] if (not numbers and unknown and any(not p.capture_only for p,_ in unknown)) else []
     for entries in unknown_bundles:
         first = min((p for p,_ in entries),key=lambda p:(p.started,p.id))
         key = ':'.join(sorted(p.id+':'+r.id for p,r in entries))

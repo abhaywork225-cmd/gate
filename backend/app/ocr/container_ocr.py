@@ -30,15 +30,33 @@ def crop_identification(image, bbox, roi=(0, 0, 1, 1)):
     return crop.copy()
 
 
-def inside_gate(bbox, image_shape, zone):
+def inside_gate(bbox, image_shape, zone, allow_headroom=True):
     """Require a detection's center and most of its area inside the gate ROI."""
     h, w = image_shape[:2]
     x1, y1, x2, y2 = bbox
     zx1, zy1, zx2, zy2 = (zone[0]*w, zone[1]*h, zone[2]*w, zone[3]*h)
-    area = max(0, x2-x1) * max(0, y2-y1)
-    overlap = max(0, min(x2,zx2)-max(x1,zx1)) * max(0,min(y2,zy2)-max(y1,zy1))
-    return (area > 0 and zx1 <= (x1+x2)/2 <= zx2 and
-            zy1 <= (y1+y2)/2 <= zy2 and overlap/area >= .8)
+    box_w = max(0, x2 - x1)
+    if box_w == 0:
+        return False
+    x_center = (x1 + x2) / 2
+    if not (zx1 <= x_center <= zx2):
+        return False
+    x_overlap = max(0, min(x2, zx2) - max(x1, zx1))
+    if x_overlap / box_w < 0.7:
+        return False
+
+    box_h = max(0, y2 - y1)
+    if box_h == 0:
+        return False
+    y_center = (y1 + y2) / 2
+    effective_zy1 = 0.0 if allow_headroom else zy1
+    if not (effective_zy1 <= y_center <= zy2):
+        return False
+    y_overlap = max(0, min(y2, zy2) - max(y1, effective_zy1))
+    if y_overlap / box_h < 0.7:
+        return False
+
+    return True
 
 
 def expand_number_crop(image, bbox, gate_roi):
@@ -47,7 +65,7 @@ def expand_number_crop(image, bbox, gate_roi):
     x1,y1,x2,y2 = bbox
     dx,dy = max(10, (x2-x1)*.15), max(5, (y2-y1)*.3)
     left=max(0,int(gate_roi[0]*w),int(x1-dx))
-    top=max(0,int(gate_roi[1]*h),int(y1-dy))
+    top=max(0,int(y1-dy))
     right=min(w,int(gate_roi[2]*w),int(x2+dx))
     bottom=min(h,int(gate_roi[3]*h),int(y2+dy))
     if right<=left or bottom<=top:

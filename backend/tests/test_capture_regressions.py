@@ -360,3 +360,21 @@ def test_checksum_valid_low_confidence_read_still_tries_enhancement():
     runtime.ocr.read.side_effect = [stronger]
     assert runtime._read_ocr(crop) == stronger
     assert runtime.ocr.read.call_count == 1
+
+
+def test_container_headroom_accepted_inside_gate():
+    from app.ocr.container_ocr import expand_number_crop
+    import numpy as np
+    zone = [0.0, 0.34, 0.85, 1.0]
+    shape = (1440, 2560, 3)
+    # Container number in upper half of frame (headroom) within calibrated lane x
+    headroom_bbox = (1500, 150, 1650, 600)
+    assert inside_gate(headroom_bbox, shape, zone)
+    # Detection outside lane horizontally is rejected
+    outside_x = (2300, 150, 2450, 600)
+    assert not inside_gate(outside_x, shape, zone)
+    # expand_number_crop does not crash or clamp top to road zone
+    image = np.zeros(shape, dtype=np.uint8)
+    crop = expand_number_crop(image, headroom_bbox, zone)
+    assert crop.shape[0] > 0 and crop.shape[1] > 0
+
