@@ -132,10 +132,14 @@ class GateRepository:
                     if old is not None:
                         old_w = max(1.0, float(old[1].detection.bbox[2] - old[1].detection.bbox[0]))
                         old_h = max(1.0, float(old[1].detection.bbox[3] - old[1].detection.bbox[1]))
-                        old_score = (old_w * old_h) * (0.5 + 0.5 * old[0].confidence)
+                        old_hw = old[1].frame.image.shape[1]
+                        old_edge = 0.25 if (old[1].detection.bbox[0] < 0.05 * old_hw or old[1].detection.bbox[2] > 0.95 * old_hw) else 1.0
+                        old_score = (old_w * old_h) * (0.5 + 0.5 * old[0].confidence) * old_edge
                     new_w = max(1.0, float(job.detection.bbox[2] - job.detection.bbox[0]))
                     new_h = max(1.0, float(job.detection.bbox[3] - job.detection.bbox[1]))
-                    new_score = (new_w * new_h) * (0.5 + 0.5 * validation.confidence)
+                    new_hw = job.frame.image.shape[1]
+                    new_edge = 0.25 if (job.detection.bbox[0] < 0.05 * new_hw or job.detection.bbox[2] > 0.95 * new_hw) else 1.0
+                    new_score = (new_w * new_h) * (0.5 + 0.5 * validation.confidence) * new_edge
                     if old is None or new_score > old_score:
                         entry['proofs'][camera_id] = (validation,job)
                 if not entry['proofs'] and number in region.reads:
@@ -170,6 +174,41 @@ class GateRepository:
             with self._write_lock,self.db.sessions.begin() as session:
                 if session.get(GateEvent,passage.id):
                     return passage.id
+                if numbers:
+                    recent = session.execute(
+                        select(GateEvent).where(
+                            GateEvent.container_number == numbers[0],
+                            GateEvent.lane_id == passage.lane_id
+                        ).order_by(GateEvent.timestamp.desc())
+                    ).scalars().all()
+                    for existing in recent:
+                        if abs((passage.started - existing.timestamp).total_seconds()) <= 60.0:
+                            existing_snaps = {s.camera_id for s in session.execute(
+                                select(Snapshot).where(Snapshot.event_id == existing.id)
+                            ).scalars().all()}
+                            bundles = [(n,entries[n]['proofs']) for n in numbers]
+                            for index,(number,proofs) in enumerate(bundles):
+                                for camera_id,(validation,job) in proofs.items():
+                                    if camera_id not in existing_snaps:
+                                        detection_id,snapshot_id = str(uuid4()),str(uuid4())
+                                        proof_folder = existing.visit_id or existing.id
+                                        path = snapshots.save_side_snapshot(proof_folder,
+                                            f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                                        created.append(path)
+                                        session.add(DetectionRecord(id=detection_id,event_id=existing.id,camera_id=camera_id,
+                                            origin_key=f'final:{existing.id}:{snapshot_id}',track_id=job.track_id,
+                                            class_name=job.detection.class_name,confidence=job.detection.confidence,
+                                            bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
+                                        session.flush()
+                                        session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
+                                            raw_text=validation.raw_text,normalized_text=number or '',
+                                            confidence=validation.confidence if number else 0,
+                                            valid_format=bool(number),valid_check_digit=bool(number),
+                                            validation_status=validation.validation_status if number else 'UNREADABLE'))
+                                        session.add(Snapshot(id=snapshot_id,event_id=existing.id,camera_id=camera_id,
+                                            image_path=path,timestamp=job.frame.timestamp))
+                            snapshots.save_event_json(existing.id,self.event(existing.id))
+                            return existing.id
                 best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
                 session.add(GateEvent(id=passage.id,gate_id=passage.gate_id,lane_id=passage.lane_id,
                     timestamp=passage.started,event_type=passage.direction,status=status,capture_policy=policy,visit_id=visit_id,

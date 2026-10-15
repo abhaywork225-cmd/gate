@@ -419,7 +419,9 @@ class PassageCollector:
             crop = job.frame.image[max(0,y1):y2,max(0,x1):x2]
             var = float(cv2.Laplacian(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),cv2.CV_64F).var()) if crop.size else 0
             box_area = max(1.0, float((x2 - x1) * (y2 - y1)))
-            quality = var * math.log1p(box_area)
+            h_img, w_img = job.frame.image.shape[:2]
+            edge_penalty = 0.25 if (job.detection.bbox[0] < 0.05 * w_img or job.detection.bbox[2] > 0.95 * w_img) else 1.0
+            quality = box_area * math.log1p(min(var, 2500.0)) * (0.5 + 0.5 * validation.confidence) * edge_penalty
             previous = region.reads.get(number)
             if previous:
                 old_validation, old_job = previous
