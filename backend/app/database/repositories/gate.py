@@ -164,7 +164,11 @@ class GateRepository:
         if len(numbers)==2 and not twin:
             raise ValueError('Different ungrouped identities require separate records')
         policy = 'FINAL_CAPTURE' if numbers else 'UNREADABLE_CAPTURE'
-        confirmed = bool(numbers) and all(sum(e['votes'].values()) >= confirmations for e in entries.values())
+        confirmed = bool(numbers) and all(
+            sum(e['votes'].values()) >= confirmations or
+            (sum(e['votes'].values()) >= 1 and any(v.valid_check_digit and v.confidence >= 0.80 for v,_ in e['proofs'].values()))
+            for e in entries.values()
+        )
         status = 'CONFIRMED' if confirmed else ('CAPTURED' if numbers else 'UNREADABLE')
         shared_folder = any(region.best_any and region.best_any[1].passage_metadata.get('shared_visit_folder')
                             for region in passage.regions)
