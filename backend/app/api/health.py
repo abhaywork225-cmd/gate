@@ -35,6 +35,10 @@ def health(request: Request):
                          'processing_error': runtime.last_processing_error,
                          'ocr_spool': spool, 'ocr_spool_error': runtime.ocr_spool_error,
                          'cloud_sync': cloud_sync,
+                         'workflow': {'mode': 'VEHICLE_VISITS' if runtime.settings.vehicle_visit_tracking else 'LEGACY_OCCUPANCY',
+                                      'reversal_grace_seconds': runtime.settings.reversal_grace_seconds,
+                                      'cross_camera_arrival_window_seconds': runtime.settings.cross_camera_arrival_window_seconds,
+                                      'active_visits': len(runtime.passages.active)},
                          'startup_error': request.app.state.startup_error}, status_code=200 if server_alive else 503)
 
 

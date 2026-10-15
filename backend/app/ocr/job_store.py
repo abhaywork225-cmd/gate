@@ -2,7 +2,7 @@ from __future__ import annotations
 """Local transactional OCR evidence spool; separate from the event database.
 
 PNG files are flushed and renamed before a metadata-only job is committed.
-When image_root is shared with SnapshotManager, all captures and crops live in
+When image_root is shared with SnapshotManager, capture references live in
 the visit folder. The queue database stores references, never a second image copy.
 """
 from contextlib import contextmanager
@@ -22,12 +22,14 @@ from app.ocr.validator import ContainerValidator
 
 
 class OCRJobStore:
-    def __init__(self, root, max_mb=10240, image_root=None):
+    def __init__(self, root, max_mb=10240, image_root=None, staged_visits=False, shared_visit_folders=False):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / 'jobs.sqlite3'
         self.image_root = Path(image_root or self.root / 'images').resolve()
         self.shared_evidence = image_root is not None
+        self.staged_visits = staged_visits
+        self.shared_visit_folders = shared_visit_folders
         self.image_root.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_mb * 1024 * 1024
         with self.connection() as db:
@@ -82,9 +84,14 @@ class OCRJobStore:
         if not self.shared_evidence:
             return
         with self.connection() as db:
-            rows = db.execute('SELECT id,origin,event_id,image FROM jobs').fetchall()
+            rows = db.execute('SELECT id,origin,event_id,image,metadata,state FROM jobs').fetchall()
         canonical = {row['origin']: row['event_id'] for row in rows if row['event_id']}
         for row in rows:
+            metadata = json.loads(row['metadata'])
+            if metadata.get('storage_visit_id'):
+                continue  # Final record IDs never rename shared visit folders.
+            if metadata.get('passage_id') and not metadata.get('finalized'):
+                continue  # Recovery must not promote or complete pending visits.
             event_id = row['event_id'] or canonical.get(row['origin'])
             if not event_id:
                 continue
@@ -186,7 +193,12 @@ class OCRJobStore:
         exposure = float(((gray > 10) & (gray < 245)).mean())
         quality = math.log1p(float(cv2.Laplacian(gray, cv2.CV_64F).var())) * exposure
         folder = str(getattr(job, 'event_id', None) or getattr(job, 'passage_id', None) or uuid4()) if self.shared_evidence else f"{job.origin_key.replace(':', '_')}_{job.frame.sequence}"
-        # Flat visit directory, unique names across cameras, tracks and retries.
+        visit_folder = folder
+        if self.shared_visit_folders and getattr(job,'passage_id',None):
+            folder = folder  # Camera and sequence are encoded in the filename.
+        elif self.staged_visits and getattr(job,'passage_id',None):
+            folder = f'_processing/{folder}/{job.frame.camera_id}'
+        # Unique names across cameras, tracks and retries.
         sample = hashlib.sha256(f'{job.origin_key}:{job.frame.source_id}:{job.frame.sequence}'.encode()).hexdigest()[:16]
         camera = job.frame.camera_id
         prefix = f'{camera}_{job.frame.sequence}_{sample}'
@@ -205,7 +217,8 @@ class OCRJobStore:
                         pass
         metadata = {
             'origin_key': job.origin_key, 'gate_id': job.gate_id, 'track_id': job.track_id,
-            'event_id': getattr(job, 'event_id', None) or (folder if self.shared_evidence else None),
+            'event_id': getattr(job, 'event_id', None) or (visit_folder if self.shared_evidence else None),
+            'storage_visit_id': visit_folder if self.shared_visit_folders else None,
             'passage_id': getattr(job, 'passage_id', None),
             'region_id': getattr(job, 'region_id', None),
             'passage_metadata': getattr(job, 'passage_metadata', {}),
@@ -237,12 +250,24 @@ class OCRJobStore:
                 self._write_image(paths[1], image_data)
             else:
                 paths = self._save_images(job.origin_key, job.frame.sequence, crop_data, image_data, folder=folder)
-            return db.execute('INSERT INTO jobs(origin,sequence,metadata,crop,image,payload_bytes) VALUES(?,?,?,?,?,?)',
+            job_id = db.execute('INSERT INTO jobs(origin,sequence,metadata,crop,image,payload_bytes) VALUES(?,?,?,?,?,?)',
                               (job.origin_key, job.frame.sequence, encoded, *paths, payload_bytes)).lastrowid
+            if not getattr(job, 'passage_id', None):
+                # Keep source files, but don't repeatedly OCR every obsolete
+                # frame of one waiting truck. Retain three independent samples.
+                db.execute("UPDATE jobs SET state='SUPERSEDED' WHERE origin=? AND state='PENDING' "
+                           "AND id NOT IN (SELECT id FROM jobs WHERE origin=? AND state='PENDING' ORDER BY id DESC LIMIT 3)",
+                           (job.origin_key, job.origin_key))
+            return job_id
+
+    def completed_event(self, job_id):
+        with self.connection() as db:
+            row = db.execute("SELECT event_id FROM jobs WHERE id=? AND state='DONE'", (job_id,)).fetchone()
+            return row['event_id'] if row else None
 
     def next_id(self):
         with self.connection() as db:
-            row = db.execute("SELECT id FROM jobs WHERE state='PENDING' AND retry_at<=? ORDER BY id DESC LIMIT 1",
+            row = db.execute("SELECT id FROM jobs WHERE state='PENDING' AND retry_at<=? ORDER BY id ASC LIMIT 1",
                              (time.time(),)).fetchone()
             return row['id'] if row else None
 
@@ -255,6 +280,114 @@ class OCRJobStore:
         with self.connection() as db:
             db.execute('UPDATE jobs SET event_id=? WHERE origin LIKE ?',
                        (event_id, f'passage:{passage_id}:%'))
+
+    def join_visit_folder(self, passage_id, visit_id):
+        """Unify proven camera views without changing job state or ownership."""
+        if not self.shared_visit_folders:
+            return
+        with self.connection() as db:
+            rows = db.execute('SELECT * FROM jobs WHERE origin LIKE ?',
+                              (f'passage:{passage_id}:%',)).fetchall()
+            for row in rows:
+                meta = json.loads(row['metadata'])
+                if meta.get('finalized'):
+                    continue
+                camera = meta['detection']['camera_id']
+                target_dir = self.image_root / str(visit_id)
+                previous_visit = meta.get('storage_visit_id')
+                if previous_visit and previous_visit != str(visit_id):
+                    previous_dir = self.image_root / previous_visit
+                    for context in previous_dir.glob('*_context_*.jpg'):
+                        target_dir.mkdir(parents=True,exist_ok=True)
+                        target = target_dir / context.name
+                        if target.exists():target = target_dir / f'{previous_visit[:8]}_{context.name}'
+                        os.replace(context,target)
+                        sidecar = context.with_suffix('.json')
+                        if sidecar.is_file():
+                            os.replace(sidecar,target.with_suffix('.json'))
+                references = {'crop':row['crop'],'image':row['image']}
+                if meta.get('original_crop'):
+                    references['original_crop'] = meta['original_crop']
+                references.update({f'companion:{cam}':path for cam,path in meta.get('companion_images',{}).items()})
+                updates = {}
+                old_dirs = set()
+                for label,relative in references.items():
+                    source = self.image_path(relative)
+                    target = target_dir / source.name
+                    old_dirs.add(source.parent)
+                    if source.resolve() != target.resolve() and source.is_file():
+                        target_dir.mkdir(parents=True,exist_ok=True)
+                        if target.exists():
+                            target = target_dir / f'{row["id"]}_{source.name}'
+                        os.replace(source,target)
+                    updates[label] = str(target.relative_to(self.image_root)) if target.exists() else relative
+                meta['storage_visit_id'] = str(visit_id)
+                meta['event_id'] = str(visit_id)
+                if 'original_crop' in updates:meta['original_crop'] = updates['original_crop']
+                meta['companion_images'] = {cam:updates[f'companion:{cam}'] for cam in meta.get('companion_images',{})}
+                db.execute('UPDATE jobs SET crop=?,image=?,metadata=?,event_id=? WHERE id=?',
+                           (updates['crop'],updates['image'],json.dumps(meta),visit_id,row['id']))
+                for directory in old_dirs:
+                    while directory != self.image_root and directory != target_dir:
+                        try:directory.rmdir()
+                        except OSError:break
+                        directory = directory.parent
+
+    def link_region(self, passage_id, region_id, event_id):
+        """Split container records cannot relabel another region's jobs."""
+        origin = f'passage:{passage_id}:{region_id}'
+        with self.connection() as db:
+            rows = db.execute('SELECT id,metadata FROM jobs WHERE origin=?',(origin,)).fetchall()
+            for row in rows:
+                meta = json.loads(row['metadata'])
+                meta['event_id'] = event_id
+                meta['finalized'] = True
+                db.execute('UPDATE jobs SET event_id=?,metadata=? WHERE id=?',
+                           (event_id,json.dumps(meta),row['id']))
+        for row in rows:
+            self.complete(row['id'],event_id)
+
+    def _remove_empty_staging_parents(self, path):
+        staging = self.image_root / '_processing'
+        parent = path.parent
+        if not parent.is_relative_to(staging):
+            return
+        while parent != self.image_root:
+            try:
+                parent.rmdir()
+            except OSError:
+                break  # Another camera/job still owns files in this directory.
+            parent = parent.parent
+
+    def discard_region(self, passage_id, region_id):
+        """Finish non-proof companion work without resurrecting it on restart."""
+        origin = f'passage:{passage_id}:{region_id}'
+        with self.connection() as db:
+            rows = db.execute('SELECT id,metadata,crop,image FROM jobs WHERE origin=?',(origin,)).fetchall()
+            for row in rows:
+                meta = json.loads(row['metadata'])
+                meta['finalized'] = True
+                db.execute("UPDATE jobs SET state='SUPERSEDED',metadata=? WHERE id=?",(json.dumps(meta),row['id']))
+                for relative in {row['crop'],row['image'],meta.get('original_crop')} - {None,''}:
+                    path = self.image_path(relative)
+                    if path.is_file():path.unlink()
+                    self._remove_empty_staging_parents(path)
+
+    def retarget_context(self, job_id, job, crop):
+        """Persist recovered text coordinates with the same immutable capture."""
+        import cv2
+        ok, encoded = cv2.imencode('.png', crop)
+        if not ok:
+            raise OSError('Recovered OCR crop encoding failed')
+        with self.connection() as db:
+            row = db.execute('SELECT metadata,crop FROM jobs WHERE id=?',(job_id,)).fetchone()
+            metadata = json.loads(row['metadata'])
+            metadata['detection'] = asdict(job.detection)
+            metadata['all_detections'] = [asdict(d) for d in job.all_detections]
+            metadata['passage_metadata'] = job.passage_metadata
+            self._write_image(row['crop'],encoded.tobytes())
+            db.execute('UPDATE jobs SET metadata=?,validation=NULL WHERE id=?',
+                       (json.dumps(metadata,default=lambda value:value.isoformat()),job_id))
 
     def passage_pending(self, passage_id):
         with self.connection() as db:
@@ -289,7 +422,7 @@ class OCRJobStore:
                      frame, data['direction'], datetime.fromisoformat(data['started_at']), tuple(data['roi']),
                      tuple(detection(d) for d in data['all_detections']), data['role'],
                      companion_frames=comp_frames, slot_position=data.get('slot_position', 'FRONT'),
-                     event_id=data.get('event_id'),
+                     event_id=data.get('storage_visit_id') or data.get('event_id'),
                      passage_id=data.get('passage_id'), region_id=data.get('region_id'),
                      passage_metadata=data.get('passage_metadata', {}),
                      is_stationary=data.get('is_stationary', True),
@@ -297,6 +430,29 @@ class OCRJobStore:
                      is_twin=data.get('is_twin', False))
         validation = Validation(**json.loads(row['validation'])) if row['validation'] else None
         return job, decode(row['crop']), validation
+
+    def save_read_crop(self, job_id, crop):
+        """Keep the exact accepted OCR crop and retain its original crop."""
+        import cv2
+        ok, encoded = cv2.imencode('.png', crop)
+        if not ok:
+            raise OSError('OCR crop encoding failed')
+        with self.connection() as db:
+            row = db.execute('SELECT crop,metadata,payload_bytes FROM jobs WHERE id=?', (job_id,)).fetchone()
+            metadata = json.loads(row['metadata'])
+            original = metadata.setdefault('original_crop', row['crop'])
+            base = Path(original)
+            target = str(base.with_name(base.stem + '_expanded.png'))
+            target_path = self.image_path(target)
+            previous_bytes = target_path.stat().st_size if target_path.exists() else 0
+            additional_bytes = len(encoded) - previous_bytes
+            if shutil.disk_usage(self.root).free < max(0, additional_bytes) + 64*1024*1024:
+                raise OSError('OCR spool lacks free space for accepted crop')
+            self._write_image(target, encoded.tobytes())
+            metadata['accepted_crop_variant'] = 'expanded_inside_gate_roi'
+            new_metadata = json.dumps(metadata)
+            size = row['payload_bytes'] + additional_bytes + len(new_metadata.encode()) - len(row['metadata'].encode())
+            db.execute('UPDATE jobs SET crop=?,metadata=?,payload_bytes=? WHERE id=?', (target, new_metadata, size, job_id))
 
     def save_validation(self, job_id, validation):
         with self.connection() as db:
@@ -322,6 +478,42 @@ class OCRJobStore:
             except (OSError, ValueError):
                 continue
         return None
+
+    def event_proof_evidence(self, event_id):
+        """Expose each camera's own immutable OCR source, never companion frames."""
+        with self.connection() as db:
+            rows = db.execute('SELECT * FROM jobs WHERE event_id=? OR metadata LIKE ?',
+                              (event_id, f'%"event_id": "{event_id}"%')).fetchall()
+        result = {'detections': [], 'ocr_results': [], 'snapshots': []}
+        for row in rows:
+            meta = json.loads(row['metadata'])
+            if (row['event_id'] or meta.get('event_id')) != event_id or not row['validation']:
+                continue
+            validation = json.loads(row['validation'])
+            value = ContainerValidator().validate(OCRRead(validation.get('raw_text', ''),
+                                                         validation.get('confidence', 0)))
+            if not value.valid_check_digit or not self.image_path(row['image']).is_file():
+                continue
+            detection = meta['detection']
+            if detection.get('class_name') != 'container_number':
+                continue
+            key = 'ocr-job-' + str(row['id'])
+            timestamp = meta['frame']['timestamp']
+            if not timestamp.endswith('Z') and '+' not in timestamp:
+                timestamp += 'Z'
+            camera = meta['frame']['camera_id']
+            origin = meta['origin_key'] + ':proof:deadline'
+            if meta.get('slot_position') == 'REAR' and ':rear' not in origin:
+                origin = meta['origin_key'] + ':rear:proof:deadline'
+            result['detections'].append({'id': key, 'origin_key': origin,
+                'camera_id': camera, 'timestamp': timestamp, 'class_name': 'container_number',
+                'bbox': detection['bbox'], 'confidence': detection.get('confidence', 0)})
+            result['ocr_results'].append({'detection_id': key, 'raw_text': value.raw_text,
+                                         'confidence': value.confidence, 'normalized_text': value.normalized_text,
+                                         'valid_check_digit': True, 'valid_format': True})
+            result['snapshots'].append({'id': key, 'camera_id': camera,
+                'timestamp': timestamp, 'image_path': row['image']})
+        return result
 
     def event_crops(self, event_id):
         """Return persisted OCR crops linked to an event for operator review."""
@@ -375,10 +567,13 @@ class OCRJobStore:
     def complete(self, job_id, event_id=None):
         with self.connection() as db:
             row = db.execute('SELECT crop,image,metadata FROM jobs WHERE id=?', (job_id,)).fetchone()
-            if row and event_id and self.shared_evidence:
-                metadata = json.loads(row['metadata'])
+            metadata = json.loads(row['metadata']) if row else {}
+            provisional = self.staged_visits and metadata.get('passage_id') and not metadata.get('finalized')
+            if row and event_id and self.shared_evidence and not provisional and not metadata.get('storage_visit_id'):
                 updates = {}
                 target_dir = self.image_root / str(event_id)
+                if self.staged_visits:
+                    target_dir = target_dir / 'evidence' / metadata['detection']['camera_id']
                 target_dir.mkdir(parents=True, exist_ok=True)
 
                 def rehome(relative, label):
@@ -425,7 +620,16 @@ class OCRJobStore:
                             old_dir.rmdir()
                         except OSError:
                             pass
+                        if self.staged_visits:
+                            parent = old_dir.parent
+                            while parent != self.image_root and '_processing' in parent.parts:
+                                try: parent.rmdir()
+                                except OSError: break
+                                parent = parent.parent
             else:
+                if row and metadata.get('storage_visit_id') and event_id:
+                    metadata['event_id'] = event_id
+                    db.execute('UPDATE jobs SET metadata=? WHERE id=?',(json.dumps(metadata),job_id))
                 db.execute("UPDATE jobs SET state='DONE', event_id=?, error_type=NULL, retry_at=? WHERE id=?",
                            (event_id, time.time(), job_id))
 
@@ -433,6 +637,30 @@ class OCRJobStore:
         with self.connection() as db:
             db.execute("UPDATE jobs SET state='DONE', event_id=?, error_type=NULL, retry_at=? WHERE origin=? AND state='PENDING'",
                        (event_id, time.time(), origin))
+
+    def retain_origin_proof(self, origin, sequence):
+        """Delete surplus completed captures while retaining OCR audit rows."""
+        with self.connection() as db:
+            rows = db.execute("SELECT * FROM jobs WHERE origin=? AND state IN ('DONE','SUPERSEDED')",
+                              (origin,)).fetchall()
+        def paths(row):
+            meta = json.loads(row['metadata'])
+            return {row['crop'], row['image'], meta.get('original_crop'),
+                    *meta.get('companion_images', {}).values()} - {None, ''}
+        protected = set()
+        for row in rows:
+            if row['sequence'] == sequence:
+                protected.update(paths(row))
+        if not protected:
+            return
+        for row in rows:
+            if row['sequence'] == sequence:
+                continue
+            for relative in paths(row) - protected:
+                path = self.image_path(relative)
+                if path.is_file():
+                    path.unlink()
+                self._remove_empty_staging_parents(path)
 
     def clean_completed(self, max_age_seconds=10, protected_origins=()):
         self._prune_completed(0, protected_origins)

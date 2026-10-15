@@ -139,8 +139,12 @@ def test_four_camera_frames_to_database_and_snapshot(settings, repository, snaps
         assert repository.events()['total'] == 2
         # A camera can contribute both captured context and its own OCR proof.
         # Check camera coverage and file integrity, not a timing-dependent count.
-        event_rows = repository.events()['items']
-        evidence = [s for event in event_rows for s in repository.event(event['id'])['snapshots']]
+        def camera_evidence():
+            event_rows = repository.events()['items']
+            return [s for event in event_rows for s in repository.event(event['id'])['snapshots']]
+        # Events can exist before the other camera's asynchronous OCR finishes.
+        wait_until(lambda: {s['camera_id'] for s in camera_evidence()} == {c.id for c in configs})
+        evidence = camera_evidence()
         assert {s['camera_id'] for s in evidence} == {c.id for c in configs}
         assert all(snapshots.path(s['image_path']).is_file() for s in evidence)
         assert len(runtime.metrics.snapshot()['inference_fps']) == 4

@@ -34,7 +34,7 @@ class YoloDetector:
         if not classes:
             return []
         results = model.predict(source=frame.image,classes=classes,
-            conf=self.settings.confidence_threshold,imgsz=self.settings.model_image_size,
+            conf=max(self.settings.confidence_threshold,self.settings.vehicle_presence_min_confidence),imgsz=self.settings.model_image_size,
             device=self.settings.model_device,verbose=False)
         output=[]
         for result in results:

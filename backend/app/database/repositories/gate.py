@@ -35,11 +35,47 @@ def review_feedback(event, readings):
                   for o in readings]
     complete = [v for v in candidates if v.valid_format]
     best = max(complete, key=lambda v: (v.valid_check_digit, v.confidence), default=None)
+    supported = {v.normalized_text for v in candidates if v.valid_check_digit}
+    unsupported = []
+    for field in ('container_number', 'container_number_2'):
+        number = event.get(field)
+        if number and number not in supported:
+            event['historical_' + field] = number
+            event[field] = None
+            unsupported.append(number)
+    if unsupported and event.get('status') == 'CONFIRMED':
+        event['status'] = 'NEEDS_REVIEW'
+    # A review identity is a provisional read, not a terminal confirmation.
+    # Prefer stronger source-supported OCR over an earlier checksum-valid typo.
+    if event.get('status') == 'NEEDS_REVIEW' and not event.get('is_twin') and best and best.valid_check_digit:
+        current_number = event.get('container_number')
+        current_confidence = max((v.confidence for v in candidates
+                                  if v.valid_check_digit and v.normalized_text == current_number), default=-1)
+        if best.confidence > current_confidence:
+            if current_number and current_number != best.normalized_text:
+                event['historical_container_number'] = current_number
+            event['container_number'] = best.normalized_text
     event['candidate_number'] = best.normalized_text if best and not event.get('container_number') else None
+    event['candidate_is_partial'] = False
+    if not event.get('container_number') and not event['candidate_number']:
+        import re
+        partials = []
+        for reading in readings:
+            raw = reading.get('raw_text', '').upper()
+            match = re.fullmatch(r'\s*([A-Z]{3}[UJZ])\s+([0-9]{6})\s*', raw)
+            if match:
+                partials.append((reading.get('confidence', 0), ''.join(match.groups())))
+        if partials:
+            event['candidate_number'] = max(partials)[1]
+            event['candidate_is_partial'] = True
     event['review_reason'] = None
     if event.get('status') != 'NEEDS_REVIEW':
         return
-    if not best:
+    if unsupported:
+        event['review_reason'] = 'Historical confirmation is unsupported by complete checksum-valid OCR text. Original evidence has been retained.'
+    elif event['candidate_is_partial']:
+        event['review_reason'] = 'Owner and serial read. The printed check digit has not been read reliably; this number is incomplete.'
+    elif not best:
         event['review_reason'] = 'OCR did not read a complete container number. Check the number crop.'
     elif not best.valid_check_digit:
         event['review_reason'] = 'Number read, but the printed check digit does not match the ISO checksum.'
@@ -78,7 +114,104 @@ class GateRepository:
         self.db = db
         self._write_lock = Lock()
 
+    def _save_final_passage(self, passage, snapshots, confirmations):
+        """Persist a final capture, with one identity's own proof per camera."""
+        entries = {}
+        unreadable = {}
+        for region in passage.regions:
+            votes = region.votes.most_common()
+            if votes and not (len(votes)>1 and votes[0][1]==votes[1][1]):
+                number,count = votes[0]
+                entry = entries.setdefault(number, {'votes':{},'proofs':{},'sequences':{}})
+                for camera_id,(validation,job) in region.source_proofs.get(number,{}).items():
+                    independent = entry['sequences'].setdefault(camera_id,set())
+                    independent.update(region.vote_sequences.get(number,set()))
+                    entry['votes'][camera_id] = max(entry['votes'].get(camera_id,0),count,len(independent))
+                    old = entry['proofs'].get(camera_id)
+                    old_score = 0.0
+                    if old is not None:
+                        old_w = max(1.0, float(old[1].detection.bbox[2] - old[1].detection.bbox[0]))
+                        old_h = max(1.0, float(old[1].detection.bbox[3] - old[1].detection.bbox[1]))
+                        old_score = (old_w * old_h) * (0.5 + 0.5 * old[0].confidence)
+                    new_w = max(1.0, float(job.detection.bbox[2] - job.detection.bbox[0]))
+                    new_h = max(1.0, float(job.detection.bbox[3] - job.detection.bbox[1]))
+                    new_score = (new_w * new_h) * (0.5 + 0.5 * validation.confidence)
+                    if old is None or new_score > old_score:
+                        entry['proofs'][camera_id] = (validation,job)
+                if not entry['proofs'] and number in region.reads:
+                    validation,job = region.reads[number]
+                    entry['votes'][job.detection.camera_id] = count
+                    entry['proofs'][job.detection.camera_id] = (validation,job)
+            elif region.best_any:
+                validation,job = region.best_any
+                unreadable.setdefault(job.detection.camera_id,(validation,job))
+        for n, entry in entries.items():
+            for region in passage.regions:
+                if region.best_any:
+                    b_val, b_job = region.best_any
+                    cam_id = b_job.detection.camera_id
+                    if cam_id not in entry['proofs']:
+                        entry['proofs'][cam_id] = (b_val, b_job)
+        numbers = sorted(entries)
+        if len(numbers)>2:
+            raise ValueError('Separate uncertain containers before saving final capture')
+        # The planner establishes physical grouping; this method never infers it.
+        twin = len(numbers)==2 and not passage.ambiguous
+        if len(numbers)==2 and not twin:
+            raise ValueError('Different ungrouped identities require separate records')
+        policy = 'FINAL_CAPTURE' if numbers else 'UNREADABLE_CAPTURE'
+        confirmed = bool(numbers) and all(sum(e['votes'].values()) >= confirmations for e in entries.values())
+        status = 'CONFIRMED' if confirmed else ('CAPTURED' if numbers else 'UNREADABLE')
+        shared_folder = any(region.best_any and region.best_any[1].passage_metadata.get('shared_visit_folder')
+                            for region in passage.regions)
+        visit_id = (passage.visit_id or passage.id) if shared_folder else None
+        created = []
+        try:
+            with self._write_lock,self.db.sessions.begin() as session:
+                if session.get(GateEvent,passage.id):
+                    return passage.id
+                best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
+                session.add(GateEvent(id=passage.id,gate_id=passage.gate_id,lane_id=passage.lane_id,
+                    timestamp=passage.started,event_type=passage.direction,status=status,capture_policy=policy,visit_id=visit_id,
+                    container_number=numbers[0] if numbers else None,
+                    container_number_2=numbers[1] if twin else None,is_twin=twin,
+                    iso_code_1=best[0].size_type if best else None,
+                    iso_code_2=best[1].size_type if twin else None))
+                session.flush()
+                bundles = [(n,entries[n]['proofs']) for n in numbers] or [(None,unreadable)]
+                for index,(number,proofs) in enumerate(bundles):
+                    for camera_id,(validation,job) in proofs.items():
+                        detection_id,snapshot_id = str(uuid4()),str(uuid4())
+                        proof_folder = visit_id or passage.id
+                        path = snapshots.save_side_snapshot(proof_folder,
+                            f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                        created.append(path)
+                        session.add(DetectionRecord(id=detection_id,event_id=passage.id,camera_id=camera_id,
+                            origin_key=f'final:{passage.id}:{snapshot_id}',track_id=job.track_id,
+                            class_name=job.detection.class_name,confidence=job.detection.confidence,
+                            bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
+                        session.flush()
+                        session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
+                            raw_text=validation.raw_text,normalized_text=number or '',
+                            confidence=validation.confidence if number else 0,
+                            valid_format=bool(number),valid_check_digit=bool(number),
+                            validation_status=validation.validation_status if number else 'UNREADABLE'))
+                        session.add(Snapshot(id=snapshot_id,event_id=passage.id,camera_id=camera_id,
+                            image_path=path,timestamp=job.frame.timestamp))
+                session.add(SystemLog(id=str(uuid4()),event_id=passage.id,level='INFO',
+                    event_name='container_capture_finalized',context={'lane_id':passage.lane_id,
+                    'identities':numbers,'status':status,'visit_id':passage.visit_id or passage.id}))
+            snapshots.save_event_json(passage.id,self.event(passage.id))
+            return passage.id
+        except Exception:
+            # A committed record must not lose proof on a manifest-write failure.
+            if self.event(passage.id) is None:
+                for path in created: snapshots.remove(path)
+            raise
+
     def save_passage(self, passage, snapshots, confirmations):
+        if passage.final_evidence:
+            return self._save_final_passage(passage,snapshots,confirmations)
         """Commit one completed truck, including independently voted identities.
 
         Region labels are internal; repeated numbers on different parts of the
@@ -194,6 +327,18 @@ class GateRepository:
             self.db.snapshot_directory = snapshots.root
         try:
             with self._write_lock, self.db.sessions.begin() as session:
+                # Improved samples of one occupancy origin must retain its
+                # original event, even if another camera offers a newer ID.
+                if obs.origin_key.startswith('dwell:'):
+                    from dataclasses import replace
+                    base = obs.origin_key.split(':late:', 1)[0]
+                    bound = session.scalar(select(DetectionRecord).where(
+                        (DetectionRecord.origin_key == base) |
+                        DetectionRecord.origin_key.startswith(base + ':late:')
+                    ).order_by(DetectionRecord.timestamp.asc()).limit(1))
+                    if bound:
+                        obs = replace(obs, event_id=bound.event_id)
+                        ongoing_event_id = bound.event_id
                 prior = session.scalar(select(DetectionRecord).where(DetectionRecord.origin_key == obs.origin_key))
                 if prior:
                     saved = session.get(GateEvent, prior.event_id)
@@ -215,13 +360,13 @@ class GateRepository:
                     else True
                 )
 
-                raw_rear_slot = getattr(obs, 'slot_position', 'FRONT') == 'REAR' or obs.origin_key.endswith(':rear')
+                raw_rear_slot = getattr(obs, 'slot_position', 'FRONT') == 'REAR'
                 # A camera/origin label alone is not proof of a second
                 # container.  Rear views can contain partial OCR, truck text,
                 # or a re-used tracker ID.  Only a validated full identity may
                 # participate in twin fusion.
                 is_rear_slot = (
-                    raw_rear_slot and bool(number) and len(number) == 11 and
+                    raw_rear_slot and obs.confirmed and bool(number) and len(number) == 11 and
                     bool(getattr(obs.ocr, 'valid_check_digit', False))
                 )
 
@@ -316,9 +461,9 @@ class GateRepository:
                             # 1. Sequential twin 20ft container passage on the same lane:
                             # A truck chassis can carry two distinct 20-foot containers (front and rear).
                             # Only fuse if twin chassis or rear slot is genuinely detected/indicated.
-                            twin_indicated = getattr(obs, 'is_twin', False) or cand.is_twin or is_rear_slot or obs.origin_key.endswith(':rear')
+                            twin_indicated = getattr(obs, 'is_twin', False) or cand.is_twin or is_rear_slot
                             if (
-                                twin_indicated and
+                                obs.confirmed and twin_indicated and
                                 number and c_num and number != c_num and
                                 len(number) == 11 and len(c_num) == 11 and
                                 time_diff <= 30.0 and
@@ -448,7 +593,7 @@ class GateRepository:
                     existing_iso = str(existing.iso_code_1 or '')
                     observed_iso = str(getattr(obs.ocr, 'size_type', None) or '')
                     both_20ft = existing_iso.startswith('2') and observed_iso.startswith('2')
-                    if same_visit and both_20ft and number != (existing.container_number_2 or ''):
+                    if obs.confirmed and same_visit and both_20ft and number != (existing.container_number_2 or ''):
                         is_rear_slot = True
 
                 if obs.origin_key.startswith('dwell:') and existing and not is_rear_slot:
@@ -472,9 +617,15 @@ class GateRepository:
                             DetectionRecord.camera_id == obs.detection.camera_id,
                             DetectionRecord.origin_key.like('dwell:%'),
                             ~DetectionRecord.origin_key.like('%:rear'),
+                            ~DetectionRecord.origin_key.startswith(obs.origin_key.split(':late:', 1)[0] + ':late:'),
+                            DetectionRecord.origin_key != obs.origin_key.split(':late:', 1)[0],
                             DetectionRecord.origin_key != obs.origin_key))
                         if prior_view:
                             existing = None  # New cleared passage, not time-window fusion.
+                            # A borrowed provisional ID must not undo the split
+                            # in the primary-key collision check below.
+                            from dataclasses import replace
+                            obs = replace(obs, event_id=str(uuid4()))
 
                 created = existing is None
                 event_id = existing.id if existing else (getattr(obs, 'event_id', None) or str(uuid4()))
@@ -930,13 +1081,42 @@ class GateRepository:
             duplicate.cloud_synced_at = utcnow()
             return True
 
+    def retain_camera_proof(self, event_id, camera_id, timestamp, snapshots):
+        """Keep the chosen source timestamp for a completed single camera slot."""
+        from sqlalchemy import delete
+        with self._write_lock, self.db.sessions.begin() as session:
+            rows = session.scalars(select(Snapshot).where(
+                Snapshot.event_id == event_id, Snapshot.camera_id == camera_id)).all()
+            keep = [r for r in rows if abs((r.timestamp - timestamp).total_seconds()) <= .05]
+            if not keep:
+                return
+            protected = {r.image_path for r in keep}
+            obsolete = [r for r in rows if r not in keep]
+            paths = {r.image_path for r in obsolete} - protected
+            for row in obsolete:
+                session.delete(row)
+        for relative in paths:
+            path = snapshots.path(relative)
+            if path.is_file():
+                path.unlink()
+            sidecar = path.with_suffix('.quality')
+            if sidecar.is_file():
+                sidecar.unlink()
+
+    def mark_capture_ready(self, event_id):
+        with self.db.sessions.begin() as session:
+            event = session.get(GateEvent, event_id)
+            if event and not event.cloud_synced:
+                event.capture_policy = 'BEST_AVAILABLE'
+                if event.status != 'CONFIRMED':
+                    event.status = 'CAPTURED'
+
     def get_unsynced_confirmed_events(self, limit: int = 50):
         with self.db.sessions() as session:
             query = (
                 select(GateEvent)
                 .where(
-                    GateEvent.status == 'CONFIRMED',
-                    (GateEvent.container_number.is_not(None) | GateEvent.container_number_2.is_not(None)),
+                    (GateEvent.status == 'CONFIRMED') | GateEvent.capture_policy.in_(['BEST_AVAILABLE','FINAL_CAPTURE','UNREADABLE_CAPTURE']),
                     (GateEvent.cloud_synced == False) | (GateEvent.cloud_synced.is_(None))
                 )
                 .order_by(GateEvent.timestamp.asc())
@@ -949,8 +1129,7 @@ class GateRepository:
             query = (
                 select(func.count(GateEvent.id))
                 .where(
-                    GateEvent.status == 'CONFIRMED',
-                    (GateEvent.container_number.is_not(None) | GateEvent.container_number_2.is_not(None)),
+                    (GateEvent.status == 'CONFIRMED') | GateEvent.capture_policy.in_(['BEST_AVAILABLE','FINAL_CAPTURE','UNREADABLE_CAPTURE']),
                     (GateEvent.cloud_synced == False) | (GateEvent.cloud_synced.is_(None))
                 )
             )
@@ -1100,6 +1279,10 @@ class GateRepository:
         with self.db.sessions() as session:
             event = session.get(GateEvent, event_id)
             if not event:
+                return event_id
+            if event.capture_policy in ('FINAL_CAPTURE','UNREADABLE_CAPTURE'):
+                # Visit IDs, not a global container-number time window, own
+                # delivery idempotency for tracked container captures.
                 return event_id
             delta = timedelta(seconds=max_gap_seconds)
             direction_match = (GateEvent.event_type == event.event_type) | (GateEvent.event_type == 'UNKNOWN')

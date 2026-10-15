@@ -329,10 +329,21 @@ class SnapshotManager:
 
     def save_event_json(self, event_id: str, event_data: dict) -> Path:
         import json
-        event_dir = self.root / str(event_id)
+        visit_id = event_data.get('visit_id')
+        event_dir = self.path(str(visit_id)) if visit_id else self.path(str(event_id))
         event_dir.mkdir(parents=True, exist_ok=True)
-        final_path = event_dir / 'event.json'
-        temp_path = event_dir / 'event.json.tmp'
+        if visit_id:
+            visit = {'visit_id':visit_id,'gate_id':event_data.get('gate_id'),
+                     'direction':event_data.get('event_type'),
+                     'container_records':sorted({event_id,*(p.stem[len('event_'):] for p in event_dir.glob('event_*.json'))}),
+                     'context_capture_files':sorted(p.name for p in event_dir.glob('*_context_*.jpg'))}
+            manifest = self.path(f'{visit_id}/visit.json')
+            temporary = manifest.with_suffix('.json.tmp')
+            import json
+            temporary.write_text(json.dumps(visit,indent=2))
+            os.replace(temporary,manifest)
+        final_path = event_dir / (f'event_{event_id}.json' if visit_id else 'event.json')
+        temp_path = final_path.with_suffix('.json.tmp')
         try:
             with temp_path.open('w', encoding='utf-8') as f:
                 json.dump(event_data, f, indent=2, default=str)
@@ -340,8 +351,8 @@ class SnapshotManager:
         finally:
             temp_path.unlink(missing_ok=True)
         manifest = self.build_evidence_manifest(event_data)
-        manifest_path = event_dir / 'evidence.json'
-        manifest_temp = event_dir / 'evidence.json.tmp'
+        manifest_path = event_dir / (f'evidence_{event_id}.json' if visit_id else 'evidence.json')
+        manifest_temp = manifest_path.with_suffix('.json.tmp')
         try:
             with manifest_temp.open('w', encoding='utf-8') as f:
                 json.dump(manifest, f, indent=2, default=str)

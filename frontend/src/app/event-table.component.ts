@@ -26,8 +26,8 @@ import { GateEvent } from './gate-api.service';
           </div>
         </div>
       } @else {
-        {{ event.container_number || event.candidate_number || 'Unread / unconfirmed' }}
-        @if (!event.container_number && event.candidate_number) { <small>Unverified</small> }
+        {{ event.container_number || event.candidate_number || (event.status === 'UNREADABLE' ? 'Unreadable · proof retained' : 'Unread / unconfirmed') }}
+        @if (!event.container_number && event.candidate_number) { <small>{{ event.candidate_is_partial ? 'Incomplete · check digit unread' : 'Unverified' }}</small> }
       }
     </td>
     <td>

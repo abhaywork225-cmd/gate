@@ -43,7 +43,7 @@ sleep 0.5
 
 # Find available port
 check_port() {
-    "$PYTHON_BIN" -c "import socket; s = socket.socket(); s.bind(('$HOST_ADDRESS', $1)); s.close()" 2>/dev/null
+    "$PYTHON_BIN" -c "import socket; s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('$HOST_ADDRESS', $1)); s.close()" 2>/dev/null
 }
 
 CURRENT_PORT=$PORT

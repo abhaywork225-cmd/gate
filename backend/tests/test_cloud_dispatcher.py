@@ -304,8 +304,8 @@ def test_each_camera_sends_one_image_without_duplicate_views(mock_settings, tmp_
         assert container['ContainerNumber'] == 'BSIU3391518'
         assert container['Position'] == 'SINGLE'
 
-        # Exactly 3 images: one from each camera, no duplicate gate-in-2 views
+        # Only the camera frame with a validated identity read is upload proof
         camera_ids = [img['CameraId'] for img in container['Images']]
-        assert camera_ids == ['gate-in-1', 'gate-in-2', 'gate-in-3']
-        assert [img['ImageType'] for img in container['Images']] == ['FRONT', 'LEFT', 'REAR']
+        assert camera_ids == ['gate-in-1']
+        assert [img['ImageType'] for img in container['Images']] == ['FRONT']
 

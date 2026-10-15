@@ -77,6 +77,20 @@ def verified_cloud_identity(event, observation, number, minimum):
     return False
 
 
+def snapshot_has_identity(snapshot, event, number, minimum):
+    """Only the source frame of an actual validated OCR read is identity proof."""
+    from app.domain import OCRRead
+    from app.ocr.validator import ContainerValidator
+    ids = set()
+    for reading in event.get('ocr_results', []):
+        value = ContainerValidator().validate(OCRRead(reading.get('raw_text', ''), reading.get('confidence', 0)))
+        if value.valid_check_digit and value.normalized_text == number and value.confidence >= minimum:
+            ids.add(reading.get('detection_id'))
+    return any(d.get('id') in ids and d.get('camera_id') == snapshot.get('camera_id')
+               and _within_capture_window(d.get('timestamp'), snapshot.get('timestamp'), .05)
+               for d in event.get('detections', []))
+
+
 def identity_confidence(event, observation, number):
     """Use the actual reading for this identity, including outbox restarts."""
     readings = [o for o in (event or {}).get('ocr_results', [])
@@ -535,6 +549,123 @@ class CloudOutboxDispatcher:
         except Exception as e:
             log.warning('prosper_backlog_sweep_error', extra={'error': str(e)})
 
+    def _best_available_payload(self, event):
+        import re
+        from app.domain import OCRRead
+        from app.ocr.validator import ContainerValidator
+        event = {**event, **{key: list(event.get(key, [])) for key in ('detections', 'ocr_results', 'snapshots')}}
+        store = getattr(self.runtime, 'ocr_store', None)
+        if store:
+            evidence = store.event_proof_evidence(event['id'])
+            for key in evidence:
+                event[key].extend(evidence[key])
+        containers = []
+        # Each deadline slot has its own saved OCR observation and source frame.
+        for slot in (('FRONT', 'REAR') if event.get('is_twin') else ('FRONT',)):
+            choices = []
+            for d in event.get('detections', []):
+                origin = d.get('origin_key', '')
+                if not origin.endswith(':deadline'):
+                    continue
+                is_rear = ':rear' in origin or origin.endswith(':rear:deadline')
+                if event.get('is_twin') and is_rear != (slot == 'REAR'):
+                    continue
+                read = next((o for o in event.get('ocr_results', []) if o.get('detection_id') == d.get('id')), {})
+                value = ContainerValidator().validate(OCRRead(read.get('raw_text', ''), read.get('confidence', 0)))
+                if not value.valid_check_digit:
+                    continue
+                number = value.normalized_text
+                expected = event.get('container_number_2') if slot == 'REAR' else event.get('container_number')
+                if expected and number != expected:
+                    continue
+                partial = re.fullmatch(r'\s*([A-Z]{3}[UJZ])\s+([0-9]{6})\s*', read.get('raw_text', '').upper())
+                if not number and partial:
+                    number = ''.join(partial.groups())
+                for snap in event.get('snapshots', []):
+                    if snap.get('camera_id') != d.get('camera_id') or not _within_capture_window(d.get('timestamp'), snap.get('timestamp'), .05):
+                        continue
+                    data = self.snapshots.path(snap['image_path']).read_bytes()
+                    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if image is None or image.size == 0 or float(image.std()) < 2:
+                        continue
+                    quality = self.snapshots.compute_quality(image)
+                    choices.append(((value.valid_check_digit, bool(number), value.confidence, quality), number, value, snap, data))
+            if not choices:
+                continue
+            _, number, value, snap, data = max(choices, key=lambda x:x[0])
+            by_camera = {}
+            for choice in choices:
+                if choice[1] != number:
+                    continue
+                camera_id = choice[3]['camera_id']
+                if camera_id not in by_camera or choice[0] > by_camera[camera_id][0]:
+                    by_camera[camera_id] = choice
+            images = [{'ImageType': slot, 'CameraId': entry[3]['camera_id'], 'CapturedAt': entry[3]['timestamp'],
+                       'Image': 'data:image/jpeg;base64,' + base64.b64encode(proof_jpeg(entry[4],entry[3],event)).decode()}
+                      for entry in by_camera.values()]
+            containers.append({'ContainerNumber': number, 'ContainerNumberConfidence': value.confidence,
+                'DetectionConfidence': 0.0, 'ValidationStatus': value.validation_status,
+                'Position': slot if event.get('is_twin') else 'SINGLE', 'Size': None, 'SizeCode': None,
+                'Images': images})
+        if not containers:
+            raise ValueError('No captured source proof is available; retry after evidence is saved')
+        return {'id':event['id'], 'VisitId':'VISIT-' + event['id'],
+            'EventType':'GATE_OUT' if event.get('event_type') in ('EXIT','OUT','GATE_OUT') else 'GATE_IN',
+            'DeviceId':self.device_uuid, 'CapturedAt':event.get('timestamp'),
+            'containerNumber':containers[0]['ContainerNumber'], 'Truck':{'TruckNumber':'NA'},
+            'Driver':None, 'Containers':containers}
+
+    def _final_capture_payload(self,event):
+        """Final source-bound proofs, including explicitly unreadable departures."""
+        numbers = [event.get('container_number')]
+        if event.get('is_twin'):
+            numbers.append(event.get('container_number_2'))
+        containers = []
+        for index,number in enumerate(numbers):
+            by_camera = {}
+            for snap in event.get('snapshots',[]):
+                if number and not snapshot_has_identity(snap,event,number,0.0):
+                    continue
+                path = self.snapshots.path(snap['image_path'])
+                if not path.is_file(): continue
+                data = path.read_bytes()
+                decoded = cv2.imdecode(np.frombuffer(data,dtype=np.uint8),cv2.IMREAD_COLOR)
+                if decoded is None or decoded.size==0: continue
+                quality = self.snapshots.compute_quality(decoded)
+                camera = snap['camera_id']
+                if camera not in by_camera or quality > by_camera[camera][0]:
+                    by_camera[camera] = (quality,snap,data)
+            if not by_camera:
+                raise ValueError('Final capture has no retained source proof')
+            position = ('FRONT' if index==0 else 'REAR') if event.get('is_twin') else 'SINGLE'
+            images = [{'ImageType':position,'CameraId':snap['camera_id'],'CapturedAt':snap['timestamp'],
+                       'Image':'data:image/jpeg;base64,'+base64.b64encode(data).decode()}
+                      for _,snap,data in by_camera.values()]
+            matching = [o for o in event.get('ocr_results',[]) if number and o.get('normalized_text')==number]
+            confidence = max((o.get('confidence',0) for o in matching),default=0)
+            containers.append({'ContainerNumber':number,'ContainerNumberConfidence':confidence,
+                'ValidationStatus':'VALID' if number else 'UNREADABLE',
+                'RecognitionStatus':('CONFIRMED' if event.get('status')=='CONFIRMED' else 'UNCONFIRMED') if number else 'UNREADABLE',
+                'Position':position,'Size':None,'SizeCode':event.get('iso_code_1' if index==0 else 'iso_code_2'),
+                'Images':images})
+        return {'id':event['id'],'VisitId':'VISIT-'+event['id'],
+            'EventType':'GATE_OUT' if event.get('event_type') in ('EXIT','OUT','GATE_OUT') else 'GATE_IN',
+            'DeviceId':self.device_uuid,'CapturedAt':event.get('timestamp'),
+            'containerNumber':numbers[0],'Truck':{'TruckNumber':'NA'},'Driver':None,'Containers':containers}
+
+    def build_proof_preview(self, event_id):
+        """Show matching source evidence without making a visit dispatchable."""
+        event = self.repository.event(event_id) if self.repository else None
+        if event and event.get('capture_policy') in ('FINAL_CAPTURE','UNREADABLE_CAPTURE'):
+            return self._final_capture_payload(event)  # Same bytes; coverage gate does not substitute images.
+        try:
+            return self.build_event_payload(event_id)
+        except ValueError:
+            event = self.repository.event(event_id) if self.repository else None
+            if not event:
+                raise
+            return self._best_available_payload(event)
+
     def build_event_payload(self, event_id: str, obs: Any = None, img_fallback: Any = None, pre_payload: Optional[dict] = None) -> dict:
         """
         Constructs the Prosper Gate Event payload.
@@ -545,7 +676,24 @@ class CloudOutboxDispatcher:
         # cannot bypass validation or substitute another visit's images.
 
         event_record = self.repository.event(event_id) if self.repository else None
+        if event_record and event_record.get('capture_policy') in ('FINAL_CAPTURE','UNREADABLE_CAPTURE'):
+            payload = self._final_capture_payload(event_record)
+            for container in payload['Containers']:
+                cameras = {image['CameraId'] for image in container['Images']}
+                if container.get('ContainerNumber') and len(cameras) < self.settings.minimum_number_proof_cameras:
+                    raise ValueError(f'Number proof incomplete: {len(cameras)} of {self.settings.minimum_number_proof_cameras} cameras for {container["ContainerNumber"]}')
+            return payload
+        if event_record and event_record.get('capture_policy') == 'BEST_AVAILABLE':
+            return self._best_available_payload(event_record)
         if event_record and self.snapshots:
+            store = getattr(self.runtime, 'ocr_store', None)
+            if store:
+                source_evidence = store.event_proof_evidence(event_id)
+                for key in source_evidence:
+                    event_record[key] = list(event_record.get(key, [])) + source_evidence[key]
+            numbers = [event_record.get('container_number'), event_record.get('container_number_2')]
+            event_record['snapshots'] = [snap for snap in event_record.get('snapshots', [])
+                if any(number and snapshot_has_identity(snap, event_record, number, 0.0) for number in numbers)]
             manifest = self.snapshots.build_evidence_manifest(
                 event_record,
                 min_quality=getattr(self.settings, 'cloud_min_proof_quality', 2.5),
@@ -594,6 +742,8 @@ class CloudOutboxDispatcher:
                     best_score = -1.0
                     for snap in snaps:
                         try:
+                            if not snapshot_has_identity(snap, event_record, cntr1, 0.0):
+                                continue
                             if valid_identity_ids:
                                 snap_ts = snap.get('timestamp')
                                 observed = any(
@@ -744,6 +894,8 @@ class CloudOutboxDispatcher:
                     best_score = -1.0
                     for snap in snaps:
                         try:
+                            if not snapshot_has_identity(snap, event_record, cntr2, 0.0):
+                                continue
                             snap_p = self.snapshots.path(snap['image_path'])
                             if not snap_p.is_file():
                                 continue
@@ -946,7 +1098,7 @@ class CloudOutboxDispatcher:
                 # the same persistent identity guard here as enqueue().
                 if self.repository:
                     current = self.repository.event(event_id)
-                    if current and (current.get('cloud_synced') or current.get('status') != 'CONFIRMED'):
+                    if current and (current.get('cloud_synced') or (current.get('status') != 'CONFIRMED' and current.get('capture_policy') not in ('BEST_AVAILABLE','FINAL_CAPTURE','UNREADABLE_CAPTURE'))):
                         self.queue.task_done()
                         continue
                     canonical = self.repository.canonical_event_id(event_id)

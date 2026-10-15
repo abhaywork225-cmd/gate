@@ -63,7 +63,7 @@ def test_multicamera_requires_shared_identity_and_never_groups_unaligned_files(s
     assert len(collector.groups())==2
 
 
-def test_multicamera_distinct_numbers_share_one_review_visit(settings, make_job):
+def test_multicamera_distinct_numbers_remain_separate(settings, make_job):
     collector, _ = setup_view(settings)
     ts = make_job().frame.timestamp
     a = Passage('a', 'camera-1', 's1', 'gate', 'one', 'ENTRY', ts, ts + timedelta(seconds=2), 1, (0,0,100,100))
@@ -72,9 +72,8 @@ def test_multicamera_distinct_numbers_share_one_review_visit(settings, make_job)
     b.regions = [Region(votes=Counter({'MSCU6639870':2}))]
     collector.passages = {'a': a, 'b': b}
     groups = collector.groups()
-    assert len(groups) == 1
-    assert len(groups[0]) == 2
-    assert a.ambiguous and b.ambiguous
+    assert len(groups) == 2
+    assert not a.ambiguous and not b.ambiguous
     b.lane_id='one';b.source_type='file'
     assert len(collector.groups())==2
 

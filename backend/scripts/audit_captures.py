@@ -2,12 +2,9 @@
 from pathlib import Path
 import sys,json,sqlite3,collections,time
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-import cv2,torch
+import cv2
 from app.domain import OCRRead
 from app.ocr.validator import ContainerValidator
-from app.config.settings import Settings
-from app.ocr.ocr_engine import EasyOCREngine
-from app.ocr.container_ocr import prepare_ocr_crop
 
 def main():
  out=Path('data/capture-audit');out.mkdir(exist_ok=True)

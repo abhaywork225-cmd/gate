@@ -66,7 +66,7 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
               </div>
 
               <div class="hero-meta-row twin-meta-row">
-                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="item.status !== 'CONFIRMED'">{{ item.status.replaceAll('_', ' ') }}</span>
+                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="(item.status !== 'CONFIRMED' && item.capture_policy !== 'BEST_AVAILABLE')">{{ item.status.replaceAll('_', ' ') }}</span>
                 <span class="movement-pill">{{ item.event_type }}</span>
                 <span class="meta-item"><strong>Lane:</strong> {{ item.gate_id }}</span>
                 <span class="meta-dot">·</span>
@@ -77,7 +77,7 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
             } @else {
               <h1 class="hero-container-title">
                 <span class="container-badge mono">{{ item.container_number || item.candidate_number || 'NUMBER NOT READ' }}</span>
-                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="item.status !== 'CONFIRMED'">
+                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="(item.status !== 'CONFIRMED' && item.capture_policy !== 'BEST_AVAILABLE')">
                   {{ item.status.replaceAll('_', ' ') }}
                 </span>
                 <span class="movement-pill">{{ item.event_type }}</span>
@@ -103,10 +103,13 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
         </div>
 
         @if (item.review_reason) {
-          <p class="review-explanation">{{ item.review_reason }}</p>
+          <div class="review-explanation" role="status"><strong>Review required</strong><p>{{ item.review_reason }}</p></div>
         }
         @if (!item.container_number && item.candidate_number) {
           <p>This OCR number is unverified and has not been sent to cloud.</p>
+        }
+        @if (item.capture_policy === 'UNREADABLE_CAPTURE') {
+          <div class="review-explanation" role="status"><strong>Container number unreadable</strong><p>The visit is captured with its best available proof. It can be sent with the number explicitly marked unreadable.</p></div>
         }
 
         <!-- Cloud Dispatch Review & Action Banner -->
@@ -129,16 +132,16 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
             } @else {
               <div class="cloud-status-badge paused">
                 <span class="badge-icon">⏸</span>
-                <span>DISPATCH PAUSED (AWAITING YOUR REVIEW)</span>
+                <span>{{ cloudEnabled() ? 'SENDING PAUSED' : 'LOCAL ONLY' }}</span>
               </div>
               <div class="cloud-banner-text">
-                <strong>Local UI Review Mode Active:</strong>
-                <span>Automatic sending to site is paused. Review all container numbers and camera captures below. When satisfied, click "Send to Site".</span>
+                <strong>{{ cloudEnabled() ? 'Review before sending' : 'Cloud sending is disabled' }}</strong>
+                <span>{{ cloudEnabled() ? 'Review the number and proof before sending this event.' : 'Events and proof images stay on this device while you review.' }}</span>
               </div>
             }
           </div>
           <div class="cloud-banner-right">
-            <button class="send-to-site-btn" [class.resend]="item.cloud_synced" [disabled]="dispatching()" (click)="dispatchToSite(item)">
+            <button class="send-to-site-btn" [class.resend]="item.cloud_synced" [disabled]="dispatching() || !cloudEnabled() || item.cloud_proof_complete === false || (item.status !== 'CONFIRMED' && !['BEST_AVAILABLE', 'FINAL_CAPTURE', 'UNREADABLE_CAPTURE'].includes(item.capture_policy || ''))" (click)="dispatchToSite(item)">
               @if (dispatching()) {
                 <span class="spinner">⏳</span> Sending to Site...
               } @else if (item.cloud_synced) {
@@ -162,7 +165,7 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
             <div class="json-header">
               <div>
                 <strong>event.json</strong>
-                <small class="json-path">snapshots/{{ item.id }}/event.json</small>
+                <small class="json-path">snapshots/{{ item.visit_id || item.id }}/{{ item.visit_id ? 'event_' + item.id + '.json' : 'event.json' }}</small>
               </div>
               <div class="json-actions">
                 <button class="copy-btn" (click)="copyJson(item)">
@@ -243,121 +246,30 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
           <div class="evidence-right">
             <div class="panel-card">
               <div class="panel-card-title">
-                <h3>Multi-Camera Snapshots & Proof</h3>
-                <span class="badge">{{ item.snapshots.length }} viewpoints</span>
+                <h3>Cloud upload proof</h3>
+                <span class="badge">{{ item.cloud_proof_images?.length || 0 }} images</span>
               </div>
-
-              @if (item.is_twin) {
-                <div class="twin-proof-grid">
-                  <!-- Front Container Proof Card -->
-                  @if (getFrontSnapshot(item); as frontSnap) {
-                    <div class="primary-proof-card twin-proof-card front-proof">
-                      <div class="proof-header front-header">
-                        <span class="proof-badge">FRONT (SLOT 1): <strong class="mono">{{ item.container_number || 'PENDING OCR' }}</strong></span>
-                        <span class="proof-cam mono">{{ frontSnap.camera_id }}</span>
-                      </div>
-                      @if (getCropForContainer(item, 1); as crop1) {
-                        <div class="ocr-crop-strip">
-                          <span class="crop-tag">NUMBER CROP</span>
-                          <img [src]="'/api/ocr-crops/' + crop1.id" alt="Front container number crop" class="crop-thumbnail">
-                          <span class="crop-text mono">{{ crop1.normalized_text || item.container_number }}</span>
-                        </div>
-                      }
-                      <div class="proof-img-wrap">
-                        <img [src]="snapshotUrl(frontSnap.id)" [alt]="'Front container proof from ' + frontSnap.camera_id" (error)="markImageError(frontSnap.id)">
-                      </div>
-                      <div class="proof-caption">
-                        <span><strong class="mono">{{ item.container_number || 'Front Container' }}</strong> · {{ frontSnap.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                        <a [href]="rawSnapshotUrl(frontSnap.id)" target="_blank" class="view-raw-link">Original frame ↗</a>
-                      </div>
-                    </div>
-                  }
-
-                  <!-- Rear Container Proof Card -->
-                  @if (getRearSnapshot(item); as rearSnap) {
-                    <div class="primary-proof-card twin-proof-card rear-proof">
-                      <div class="proof-header rear-header">
-                        <span class="proof-badge">REAR (SLOT 2): <strong class="mono">{{ item.container_number_2 || 'PENDING OCR' }}</strong></span>
-                        <span class="proof-cam mono">{{ rearSnap.camera_id }}</span>
-                      </div>
-                      @if (getCropForContainer(item, 2); as crop2) {
-                        <div class="ocr-crop-strip">
-                          <span class="crop-tag">NUMBER CROP</span>
-                          <img [src]="'/api/ocr-crops/' + crop2.id" alt="Rear container number crop" class="crop-thumbnail">
-                          <span class="crop-text mono">{{ crop2.normalized_text || item.container_number_2 }}</span>
-                        </div>
-                      }
-                      <div class="proof-img-wrap">
-                        <img [src]="snapshotUrl(rearSnap.id)" [alt]="'Rear container proof from ' + rearSnap.camera_id" (error)="markImageError(rearSnap.id)">
-                      </div>
-                      <div class="proof-caption">
-                        <span><strong class="mono">{{ item.container_number_2 || 'Rear Container' }}</strong> · {{ rearSnap.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                        <a [href]="rawSnapshotUrl(rearSnap.id)" target="_blank" class="view-raw-link">Original frame ↗</a>
-                      </div>
-                    </div>
-                  }
-                </div>
-              } @else {
-                @if (getPrimarySnapshot(item); as primary) {
-                  <div class="primary-proof-card">
-                    <div class="proof-header">
-                      <span class="proof-badge">PRIMARY CONTAINER PROOF: <strong class="mono">{{ item.container_number || 'PENDING OCR' }}</strong></span>
-                      <span class="proof-cam mono">{{ primary.camera_id }}</span>
-                    </div>
-                    @if (getCropForContainer(item, 1); as cropSingle) {
-                      <div class="ocr-crop-strip">
-                        <span class="crop-tag">NUMBER CROP</span>
-                        <img [src]="'/api/ocr-crops/' + cropSingle.id" alt="Container number crop" class="crop-thumbnail">
-                        <span class="crop-text mono">{{ cropSingle.normalized_text || item.container_number }}</span>
-                      </div>
-                    }
-                    <div class="proof-img-wrap">
-                      <img [src]="snapshotUrl(primary.id)" [alt]="'Container proof from ' + primary.camera_id" (error)="markImageError(primary.id)">
-                    </div>
-                    <div class="proof-caption">
-                      <span><strong>{{ item.container_number || 'Detected Container' }}</strong> · {{ primary.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                      <a [href]="rawSnapshotUrl(primary.id)" target="_blank" class="view-raw-link">Original frame ↗</a>
-                    </div>
-                  </div>
+              <p class="image-refresh-note">Exact images selected by the cloud upload builder. Preview only; no data is sent.</p>
+              @for (coverage of item.cloud_proof_coverage || []; track $index) {
+                @if (coverage.required > 0) {
+                  <p class="image-refresh-note" [class.review-explanation]="!coverage.complete">
+                    {{ coverage.container_number }}: number proof from {{ coverage.cameras.length }} of {{ coverage.required }} required cameras.
+                    @if (!coverage.complete) { Sending is held until a second camera provides matching number proof. }
+                  </p>
                 }
               }
-
-              <div class="multi-angle-heading">
-                <h4 class="multi-angle-title">All captured camera images ({{ item.snapshots.length }})</h4>
-                <span class="image-refresh-note">Matched proof includes the number crop and raw OCR. Full resolution opens the unmodified capture.</span>
-              </div>
-              <div class="snapshots-grid">
-                @for (s of item.snapshots; track s.id) {
-                  <figure class="snapshot-card" [class.is-primary]="s.id === item.primary_snapshot_id || s.id === item.rear_snapshot_id">
-                    <div class="snapshot-img-wrap">
-                      @if (imageErrors()[s.id]) {
-                        <div class="snapshot-error" role="status">
-                          <span class="snapshot-error-icon">⚠</span>
-                          <strong>Image unavailable</strong>
-                          <small>{{ s.camera_id }} · refresh the event</small>
-                        </div>
-                      } @else {
-                        <img [src]="snapshotUrl(s.id)" [alt]="'Snapshot from ' + s.camera_id" (error)="markImageError(s.id)" (load)="markImageLoaded(s.id)">
-                        @if (!imageLoaded()[s.id]) {
-                          <span class="snapshot-loading">Loading proof view…</span>
-                        }
-                      }
-                      <span class="camera-tag">{{ s.camera_id }}</span>
-                      @if (s.id === item.primary_snapshot_id) {
-                        <span class="primary-tag">FRONT PROOF</span>
-                      } @else if (s.id === item.rear_snapshot_id) {
-                        <span class="primary-tag rear-tag">REAR PROOF</span>
-                      }
-                    </div>
-                    <figcaption>
-                      <span class="snap-time">{{ s.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                      <a [href]="'/api/snapshots/' + s.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
-                    </figcaption>
-                  </figure>
-                } @empty {
-                  <p class="empty-hint">No camera snapshots recorded for this event.</p>
-                }
-              </div>
+              @for (proof of item.cloud_proof_images || []; track $index) {
+                <figure class="primary-proof-card">
+                  <div class="proof-header">
+                    <span class="proof-badge">{{ proof.position }} · {{ proof.container_number }}</span>
+                    <span class="proof-cam">{{ proof.camera_id }} · {{ proof.image_type }}</span>
+                  </div>
+                  <div class="proof-img-wrap"><img [src]="proof.image" [alt]="'Cloud upload proof for ' + proof.container_number + ' from ' + proof.camera_id"></div>
+                  <figcaption class="proof-caption">{{ proof.captured_at | date:'HH:mm:ss · dd MMM yyyy' }}</figcaption>
+                </figure>
+              } @empty {
+                <p class="review-explanation" role="status">{{ item.cloud_proof_error || 'No usable cloud proof images are available.' }}</p>
+              }
             </div>
           </div>
         </div>
@@ -374,6 +286,12 @@ export class EventDetailComponent {
   copied = signal(false);
   imageLoaded = signal<Record<string, boolean>>({});
   imageErrors = signal<Record<string, boolean>>({});
+
+  cloudEnabled = signal(false);
+
+  constructor() {
+    this.gateApi.cloudSyncStatus().subscribe({next: status => this.cloudEnabled.set(status.enabled), error: () => this.cloudEnabled.set(false)});
+  }
 
   dispatching = signal(false);
   dispatchSuccess = signal(false);
@@ -400,7 +318,7 @@ export class EventDetailComponent {
   }
 
   dispatchToSite(item: EventDetail) {
-    if (!item?.id || this.dispatching()) return;
+    if (!item?.id || this.dispatching() || !this.cloudEnabled() || (item.status !== 'CONFIRMED' && item.capture_policy !== 'BEST_AVAILABLE')) return;
     this.dispatching.set(true);
     this.dispatchMessage.set(null);
 

@@ -21,7 +21,10 @@ export interface LaneCalibration { camera_id: string; occupancy_roi: number[]; l
 export interface CameraSource { id: string; name: string; host?: string; configured: boolean; discovered?: boolean; connection_hint?: string; }
 export interface DiscoveryStatus { state: string; found: number; message: string; }
 export interface GateEvent {
+  visit_id?: string | null;
   candidate_number?: string | null;
+  candidate_is_partial?: boolean;
+  capture_policy?: string | null;
   review_reason?: string | null;
   id: string;
   gate_id: string;
@@ -44,6 +47,10 @@ export interface OCR { id: string; raw_text: string; normalized_text: string; co
 export interface Snapshot { id: string; camera_id: string; timestamp: string; image_path?: string; }
 export interface OcrCrop { id: string; camera_id?: string; timestamp?: string; slot_position: string; normalized_text?: string | null; }
 export interface EventDetail extends GateEvent {
+  cloud_proof_complete?: boolean;
+  cloud_proof_coverage?: {container_number: string | null; cameras: string[]; required: number; complete: boolean}[];
+  cloud_proof_images?: {container_number: string; position: string; camera_id: string; image_type: string; captured_at: string; image: string}[];
+  cloud_proof_error?: string | null;
   detections: Detection[];
   ocr_results: OCR[];
   snapshots: Snapshot[];

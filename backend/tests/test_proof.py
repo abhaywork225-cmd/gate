@@ -25,7 +25,9 @@ def test_unlinked_or_wrong_identity_returns_original():
     assert proof_jpeg(data, {**snap, 'image_path': 'cam.jpg'}, event) == data
     assert proof_jpeg(data, {**snap, 'timestamp': 'other'}, event) == data
     assert proof_jpeg(data, snap, {**event, 'container_number': 'OTHER'}) == data
-    assert proof_jpeg(b'broken', snap, event) == b'broken'
+    import pytest
+    with pytest.raises(ValueError, match='cannot be decoded'):
+        proof_jpeg(b'broken', snap, event)
 
 
 def test_proof_does_not_apply_full_frame_bbox():

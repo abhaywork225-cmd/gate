@@ -93,3 +93,50 @@ def test_cloud_sync_status_and_retry_api(settings, repository, camera):
         health = client.get('/api/health').json()
         assert 'cloud_sync' in health
         assert health['cloud_sync']['pending_count'] == data['pending_count']
+
+
+def test_cloud_proof_preview_uses_payload_images_without_dispatch(settings, repository, camera, make_job, snapshots):
+    from unittest.mock import Mock
+    event_id, _ = repository.save_observation(observation(make_job()), snapshots, 30)
+    app = create_app(settings, repository.db, [camera])
+    with TestClient(app) as client:
+        dispatcher = app.state.runtime.dispatcher
+        dispatcher.build_event_payload = Mock(return_value={'Containers': [{
+            'ContainerNumber': 'CSQU3054383', 'Position': 'FRONT', 'Images': [{
+                'CameraId': 'camera-1', 'ImageType': 'FRONT', 'CapturedAt': '2026-10-07T00:00:00Z',
+                'Image': 'data:image/jpeg;base64,exact-upload-bytes'}]}]})
+        dispatcher.dispatch_event = Mock(side_effect=AssertionError('Preview must never send'))
+        result = client.get('/api/gate-events/' + event_id).json()
+        assert result['cloud_proof_images'][0]['image'] == 'data:image/jpeg;base64,exact-upload-bytes'
+        dispatcher.dispatch_event.assert_not_called()
+
+
+def test_review_event_can_display_matching_proof_without_becoming_dispatchable(settings, repository, camera, make_job, snapshots):
+    from dataclasses import replace
+    from unittest.mock import Mock
+    from app.domain import OCRRead
+    from app.ocr.validator import ContainerValidator
+    job = make_job()
+    import numpy as np
+    image = np.random.default_rng(7).integers(20, 235, (480,640,3), dtype=np.uint8)
+    obs = replace(observation(job), image=image, confirmed=False,
+                  ocr=ContainerValidator().validate(OCRRead('MRKU4313394', .9698)))
+    event_id, _ = repository.save_observation(obs, snapshots, 30)
+    second_camera = camera.model_copy(update={'id': 'camera-2', 'name': 'View 2'})
+    repository.sync_cameras([camera, second_camera])
+    secondary = replace(obs, origin_key='other-view:1',
+                        detection=replace(obs.detection, camera_id='camera-2'),
+                        ocr=ContainerValidator().validate(OCRRead('MRKU 431339 4', .5437)),
+                        event_id=event_id)
+    repository.save_observation(secondary, snapshots, 30, ongoing_event_id=event_id)
+    app = create_app(settings, repository.db, [camera, second_camera])
+    with TestClient(app) as client:
+        dispatcher = app.state.runtime.dispatcher
+        dispatcher.dispatch_event = Mock(side_effect=AssertionError('Preview must never send'))
+        result = client.get('/api/gate-events/' + event_id).json()
+        assert result['status'] == 'NEEDS_REVIEW'
+        assert result['cloud_proof_images'], result['cloud_proof_error']
+        assert result['cloud_proof_images'][0]['container_number'] == 'MRKU4313394'
+        assert {p['camera_id'] for p in result['cloud_proof_images']} == {'camera-1', 'camera-2'}
+        assert not result['cloud_synced']
+        dispatcher.dispatch_event.assert_not_called()

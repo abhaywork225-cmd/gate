@@ -24,9 +24,9 @@ def test_single_container_lifecycle(settings, camera):
     assert 'FRONT' in view.current.slots
 
     # Confirm event
-    view.confirm(view.current.origin, 'evt-single', 'MSCU1234567')
+    view.confirm(view.current.origin, 'evt-single', 'MSCU1234566')
     assert view.current.closed is True
-    assert view.current.container_number == 'MSCU1234567'
+    assert view.current.container_number == 'MSCU1234566'
 
 
 def test_twin_containers_simultaneous_arrival(settings, camera):
@@ -89,7 +89,7 @@ def test_twin_containers_saved_under_single_event_id(repository, snapshots, came
     repo = repository
 
     frame1, (det1,) = make_frame_detections(0, [(55, 20, 90, 80)], camera_id=camera.id)
-    val1 = Validation('MSCU1234567', 'MSCU1234567', 0.99, True, True, 'VALID', size_type='22G1')
+    val1 = Validation('MSCU1234566', 'MSCU1234566', 0.99, True, True, 'VALID', size_type='22G1')
     obs1 = Observation(f'dwell:{camera.id}:uuid1:front', camera.gate_id, 1, det1, val1, 'IN',
                        frame1.image, frame1.timestamp, True, slot_position='FRONT')
 
@@ -100,7 +100,7 @@ def test_twin_containers_saved_under_single_event_id(repository, snapshots, came
 
     # 2. Rear container arrives on same truck (ongoing_event_id = event_id)
     frame2, (det2,) = make_frame_detections(1, [(10, 20, 45, 80)], camera_id=camera.id)
-    val2 = Validation('TGHU7654321', 'TGHU7654321', 0.98, True, True, 'VALID', size_type='22G1')
+    val2 = Validation('TGHU7654320', 'TGHU7654320', 0.98, True, True, 'VALID', size_type='22G1')
     obs2 = Observation(f'dwell:{camera.id}:uuid1:rear', camera.gate_id, 2, det2, val2, 'IN',
                        frame2.image, frame2.timestamp, True, slot_position='REAR')
 
@@ -113,8 +113,8 @@ def test_twin_containers_saved_under_single_event_id(repository, snapshots, came
     assert full_event is not None
     assert full_event['id'] == event_id
     assert full_event['is_twin'] is True
-    assert full_event['container_number'] == 'MSCU1234567'
-    assert full_event['container_number_2'] == 'TGHU7654321'
+    assert full_event['container_number'] == 'MSCU1234566'
+    assert full_event['container_number_2'] == 'TGHU7654320'
     assert full_event['container_size'] == '20 FT'
     assert full_event['container_size_2'] == '20 FT'
     assert full_event['size_code'] == '22G1'
@@ -136,9 +136,13 @@ def test_twin_containers_detected_via_container_number_markings(settings, camera
 
     det = view.update(camera, frame, [det_front, det_rear])
     assert det is not None
+    assert not view.current.is_twin  # Two queued trucks can show two markings.
+    view = ViewOccupancy(settings)
+    truck = Detection(camera.id, ts, 'truck', .95, (200, 200, 1200, 720))
+    det = view.update(camera, frame, [det_front, det_rear, truck])
+    assert det is not None
     assert view.current is not None
     assert view.current.is_twin is True
     assert len(view.current.slots) == 2
     assert 'FRONT' in view.current.slots
     assert 'REAR' in view.current.slots
-

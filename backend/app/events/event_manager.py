@@ -47,8 +47,7 @@ class EventManager:
         votes = Counter(r.normalized_text for r in good)
         best, count = votes.most_common(1)[0] if votes else (None, 0)
         tied = sum(v == count for v in votes.values()) > 1
-        confirmed = (count >= self.settings.ocr_confirmations and not tied
-                     and getattr(job, 'is_stationary', True))
+        confirmed = count >= self.settings.ocr_confirmations and not tied
         if not confirmed:
             # Never publish an unconfirmed / NEEDS_REVIEW event until all OCR attempts are completed!
             if len(evidence.reads) < self.settings.ocr_max_attempts:
@@ -106,6 +105,8 @@ class EventManager:
                 any(str(item.get('image_path', '')).endswith('_rear.jpg') for item in snapshots)
             )
         should_dispatch = obs.confirmed and cloud_ready and (event_id not in self._dispatched_events)
+        if self.runtime and hasattr(self.runtime, 'capture_deadlines'):
+            should_dispatch = False  # One deadline controller owns publication.
         if self.dispatcher and should_dispatch:
             self._dispatched_events.add(event_id)
             # Do not publish at the first valid OCR vote.  A second camera can

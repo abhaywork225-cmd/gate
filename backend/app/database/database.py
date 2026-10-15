@@ -44,6 +44,10 @@ class Database:
             insp = inspect(conn)
             if 'gate_events' in insp.get_table_names():
                 cols = {c['name'] for c in insp.get_columns('gate_events')}
+                if 'visit_id' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN visit_id VARCHAR(36)')
+                if 'capture_policy' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN capture_policy VARCHAR(20)')
                 if 'lane_id' not in cols:
                     conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN lane_id VARCHAR(32)')
                 if 'is_twin' not in cols:

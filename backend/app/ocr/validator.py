@@ -146,10 +146,6 @@ class ContainerValidator:
         valid_format = bool(STRUCTURE.fullmatch(normalized))
         valid_digit = valid_format and check_digit(normalized[:10]) == int(normalized[10])
 
-        # Reject known hallucinations from old prompt examples
-        if normalized in ('TIIU5077669', 'MSCU6546021'):
-            return Validation(raw, '', 0.0, False, False, 'PROMPT_LEAK_DISCARDED')
-
         status = 'VALID' if valid_digit else 'INVALID_CHECK_DIGIT' if valid_format else 'INVALID_FORMAT'
         iso_code, human_size = extract_iso_size_code(raw)
         return Validation(raw, normalized, read.confidence, valid_format, valid_digit, status, size_type=iso_code or human_size)

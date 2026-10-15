@@ -198,3 +198,98 @@ def test_partial_image_write_never_exposes_job(tmp_path, make_job, monkeypatch):
     assert store.next_id() == key
     with pytest.raises(ValueError):
         store.image_path('../outside.png')
+
+
+def test_waiting_visit_keeps_three_pending_samples_and_preserves_all_images(tmp_path, make_job):
+    from app.ocr.job_store import OCRJobStore
+    store = OCRJobStore(tmp_path / 'spool')
+    ids = []
+    for sequence in range(1, 11):
+        job = make_job(sequence)
+        ids.append(store.save(job, job.frame.image))
+    with store.connection() as db:
+        rows = db.execute('SELECT id,state,crop,image FROM jobs ORDER BY id').fetchall()
+    assert [r['id'] for r in rows if r['state'] == 'PENDING'] == ids[-3:]
+    assert all(store.image_path(r['crop']).is_file() and store.image_path(r['image']).is_file() for r in rows)
+    assert store.next_id() == ids[-3]
+
+
+def test_finished_origin_removes_surplus_images_but_retains_selected_proof(tmp_path, make_job):
+    from app.ocr.job_store import OCRJobStore
+    store = OCRJobStore(tmp_path / 'spool')
+    for sequence in (1, 2, 3):
+        job = make_job(sequence)
+        key = store.save(job, job.frame.image)
+        store.complete(key)
+    with store.connection() as db:
+        rows = db.execute('SELECT * FROM jobs ORDER BY id').fetchall()
+    store.retain_origin_proof(make_job().origin_key, 2)
+    for row in rows:
+        assert store.image_path(row['image']).is_file() == (row['sequence'] == 2)
+        assert store.image_path(row['crop']).is_file() == (row['sequence'] == 2)
+    with store.connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 3
+
+
+def test_staged_visit_restart_and_final_camera_folder(tmp_path,make_job):
+    job=replace(make_job(origin='passage:passage:number'),event_id='visit',passage_id='passage',region_id='number')
+    root=tmp_path/'snapshots';spool=tmp_path/'spool'
+    store=OCRJobStore(spool,image_root=root,staged_visits=True)
+    key=store.save(job,np.full((30,40,3),120,dtype=np.uint8))
+    store=OCRJobStore(spool,image_root=root,staged_visits=True)
+    with store.connection() as db:
+        row=db.execute('SELECT * FROM jobs WHERE id=?',(key,)).fetchone()
+    assert row['state']=='PENDING'
+    assert row['image'].startswith('_processing/visit/'+job.frame.camera_id+'/')
+    assert not (root/'visit').exists()
+    store.complete(key,'visit')
+    assert not (root/'visit').exists()
+    store.link_region('passage','number','final-event')
+    with store.connection() as db:
+        row=db.execute('SELECT * FROM jobs WHERE id=?',(key,)).fetchone()
+    assert row['image'].startswith('final-event/evidence/'+job.frame.camera_id+'/')
+    assert store.image_path(row['image']).is_file()
+    assert not (root/'_processing'/'visit').exists()
+    store=OCRJobStore(spool,image_root=root,staged_visits=True)
+    _,_,_=store.load(key)
+
+
+def test_discarded_staging_region_keeps_other_camera_files(tmp_path,make_job):
+    store=OCRJobStore(tmp_path/'spool',image_root=tmp_path/'snapshots',staged_visits=True)
+    for cam,region in [('camera-1','one'),('camera-2','two')]:
+        job=replace(make_job(camera_id=cam,origin='passage:p:'+region),
+                    event_id='visit',passage_id='p',region_id=region)
+        store.save(job,np.full((20,30,3),120,dtype=np.uint8))
+    root=store.image_root/'_processing'/'visit'
+    store.discard_region('p','one')
+    assert not (root/'camera-1').exists()
+    assert (root/'camera-2').exists()
+    store.discard_region('p','two')
+    assert not root.exists()
+
+
+def test_shared_visit_completion_never_moves_capture_files(tmp_path,make_job):
+    store=OCRJobStore(tmp_path/'spool',image_root=tmp_path/'snapshots',shared_visit_folders=True)
+    job=replace(make_job(origin='passage:p:r'),event_id='visit',passage_id='p',region_id='r')
+    key=store.save(job,np.full((30,40,3),120,dtype=np.uint8))
+    with store.connection() as db:before=dict(db.execute('select * from jobs where id=?',(key,)).fetchone())
+    assert before['image'].startswith('visit/') and len(before['image'].split('/'))==2
+    store.complete(key,'p');store.link_region('p','r','container-record')
+    reopened=OCRJobStore(tmp_path/'spool',image_root=tmp_path/'snapshots',shared_visit_folders=True)
+    with reopened.connection() as db:after=dict(db.execute('select * from jobs where id=?',(key,)).fetchone())
+    assert before['image']==after['image'] and before['crop']==after['crop']
+    assert after['event_id']=='container-record'
+    assert not (store.image_root/'container-record').exists()
+    assert reopened.image_path(after['image']).is_file()
+
+
+def test_proven_camera_join_preserves_pending_jobs(tmp_path,make_job):
+    store=OCRJobStore(tmp_path/'spool',image_root=tmp_path/'snapshots',shared_visit_folders=True)
+    job=replace(make_job(origin='passage:p:r'),event_id='separate',passage_id='p',region_id='r')
+    key=store.save(job,np.full((30,40,3),120,dtype=np.uint8))
+    store.join_visit_folder('p','shared')
+    with store.connection() as db:row=dict(db.execute('select * from jobs where id=?',(key,)).fetchone())
+    assert row['state']=='PENDING' and row['event_id']=='shared'
+    assert row['image'].startswith('shared/') and len(row['image'].split('/'))==2
+    assert not (store.image_root/'separate').exists()
+    assert store.image_path(row['image']).is_file()

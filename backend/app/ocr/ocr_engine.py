@@ -270,6 +270,131 @@ class EasyOCREngine:
         with self._lock:
             return self._do_read(image)
 
+    def _read_stacked_number(self, image):
+        """Read owner above serial with its separately boxed printed digit."""
+        import cv2
+        import numpy as np
+        h,w = image.shape[:2]
+        if not .8 <= w/max(1,h) < 2.5:
+            return None
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        for bright, threshold in ((False,100), (False,130), (True,150)):
+            mask = gray > threshold if bright else gray < threshold
+            contours,_ = cv2.findContours(mask.astype(np.uint8)*255,
+                                          cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            boxes = [cv2.boundingRect(c) for c in contours
+                     if .15*h < cv2.boundingRect(c)[3] < .6*h
+                     and 3 <= cv2.boundingRect(c)[2] < .4*w]
+            owner = sorted([b for b in boxes if b[1]+b[3]/2 < .45*h])
+            serial = sorted([b for b in boxes if .45*h <= b[1]+b[3]/2 < .94*h])
+            if len(owner) == 4 and 7 < len(serial) <= 9:
+                tail = serial[6:]
+                if all(tail[i][0] <= tail[i-1][0]+tail[i-1][2]+3 for i in range(1,len(tail))):
+                    x=min(b[0] for b in tail); y=min(b[1] for b in tail)
+                    serial = serial[:6] + [(x,y,max(b[0]+b[2] for b in tail)-x,
+                                                max(b[1]+b[3] for b in tail)-y)]
+            if len(owner) != 4 or len(serial) != 7:
+                continue
+            read = self._recognize_number_segments(image,owner,serial[:6],serial[6:])
+            if read:
+                return read
+        return None
+
+    def _read_vertical_number(self, image):
+        for threshold in (150, 120, 100):
+            read = self._read_vertical_threshold(image, threshold)
+            if read:
+                return read
+        return None
+
+    def _read_vertical_threshold(self, image, threshold):
+        """Reassemble an observed 11-glyph column, including its boxed digit."""
+        import cv2
+        import numpy as np
+        h, w = image.shape[:2]
+        if h < 2.5 * w:
+            return None
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        mask = (gray > threshold).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = sorted((cv2.boundingRect(c) for c in contours), key=lambda b: b[1])
+        boxes = [b for b in boxes if .05*h < b[3] < .16*h and 3 <= b[2] <= w]
+        from app.ocr.container_ocr import vertical_glyph_column
+        column = vertical_glyph_column(boxes, h)
+        if column is not None:
+            boxes = column
+        if len(boxes) != 11:
+            # Worn boxed digits can split into overlapping contours. Keep the
+            # union of observed strokes at each row; do not synthesize glyphs.
+            fragments = sorted([cv2.boundingRect(c) for c in contours
+                                if .025*h < cv2.boundingRect(c)[3] < .16*h
+                                and 3 <= cv2.boundingRect(c)[2] <= w], key=lambda b:b[1])
+            merged = []
+            for x,y,bw,bh in fragments:
+                if merged and y < merged[-1][1] + merged[-1][3]:
+                    px,py,pw,ph = merged.pop()
+                    left,top = min(px,x),min(py,y)
+                    merged.append((left,top,max(px+pw,x+bw)-left,max(py+ph,y+bh)-top))
+                else:
+                    merged.append((x,y,bw,bh))
+            boxes = merged
+        boxes = vertical_glyph_column(boxes, h)
+        if boxes is None:
+            return None
+        pieces = []
+        positions = []
+        cursor = 0
+        for index, (x, y, bw, bh) in enumerate(boxes):
+            part = image[y:y+bh, x:x+bw]
+            if index == 10:
+                from app.ocr.container_ocr import rectify_printed_digit_box
+                digit = image[max(0,y-3):min(h,y+bh+3),max(0,x-3):min(w,x+bw+3)]
+                unboxed = rectify_printed_digit_box(digit)
+                if unboxed is not None:
+                    part = unboxed
+            width = max(18, int(48*bw/max(1,bh)))
+            part = cv2.resize(part, (width,48), interpolation=cv2.INTER_CUBIC)
+            positions.append((cursor+6,6,width,48))
+            cursor += width + 12 + (20 if index in (3,9) else 0)
+            pieces.append(cv2.copyMakeBorder(part,6,6,6,26 if index in (3,9) else 6,
+                                            cv2.BORDER_CONSTANT, value=(70,70,70)))
+        line = np.concatenate(pieces, axis=1)
+        read = self._recognize_number_segments(line, positions[:4], positions[4:10], positions[10:])
+        if read:
+            return read
+        # Perspective compresses the strokes of a vertical column. Deskew
+        # each measured glyph before presenting the column as a text line.
+        # This only runs on a unique, complete 11-component column.
+        pieces, positions, cursor = [], [], 0
+        for index, bbox in enumerate(boxes):
+            contour = next((c for c in contours if cv2.boundingRect(c) == bbox), None)
+            if contour is None:
+                return None  # Merged fragments do not have a measured orientation.
+            points = cv2.boxPoints(cv2.minAreaRect(contour))
+            by_y = points[np.argsort(points[:, 1])]
+            top = by_y[:2][np.argsort(by_y[:2, 0])]
+            bottom = by_y[2:][np.argsort(by_y[2:, 0])]
+            corners = np.float32([top[0], top[1], bottom[1], bottom[0]])
+            if cv2.contourArea(corners) < 4:
+                return None
+            width, height = 44, 80
+            target = np.float32([[0,0],[width-1,0],[width-1,height-1],[0,height-1]])
+            part = cv2.warpPerspective(image, cv2.getPerspectiveTransform(corners,target),
+                                       (width,height), flags=cv2.INTER_CUBIC)
+            if index == 10:
+                from app.ocr.container_ocr import rectify_printed_digit_box
+                x,y,bw,bh = bbox
+                digit = image[max(0,y-3):min(h,y+bh+3),max(0,x-3):min(w,x+bw+3)]
+                unboxed = rectify_printed_digit_box(digit)
+                if unboxed is not None:
+                    part = cv2.resize(unboxed,(width,height),interpolation=cv2.INTER_CUBIC)
+            positions.append((cursor+6,6,width,height))
+            cursor += width+12+(20 if index in (3,9) else 0)
+            pieces.append(cv2.copyMakeBorder(part,6,6,6,26 if index in (3,9) else 6,
+                                            cv2.BORDER_CONSTANT,value=(70,70,70)))
+        line = np.concatenate(pieces, axis=1)
+        return self._recognize_number_segments(line, positions[:4], positions[4:10], positions[10:])
+
     def _read_segmented_number(self, image):
         """Read separately printed owner/serial/check-digit glyphs on white-text crops.
 
@@ -285,12 +410,24 @@ class EasyOCREngine:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         # Both white markings on dark steel and black markings on light steel.
         layouts = []
-        for bright in (True, False):
-            mask = ((gray > 150) if bright else (gray < 100)).astype(np.uint8) * 255
+        from app.ocr.container_ocr import horizontal_number_layout
+        for bright, threshold in ((True,120),(True,150),(False,100)):
+            mask = ((gray > threshold) if bright else (gray < threshold)).astype(np.uint8) * 255
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            boxes = sorted([cv2.boundingRect(c) for c in contours
-                            if .4*h <= cv2.boundingRect(c)[3] <= h
-                            and 3 <= cv2.boundingRect(c)[2] < .35*w])
+            components = [cv2.boundingRect(c) for c in contours
+                          if .25*h <= cv2.boundingRect(c)[3] <= h
+                          and 3 <= cv2.boundingRect(c)[2] < .35*w]
+            complete = horizontal_number_layout(components, image.shape)
+            if complete:
+                read = self._recognize_number_segments(image,*complete)
+                # A geometry-selected segmentation can accidentally satisfy
+                # the checksum on blurry glyphs. Require strong measured
+                # recognition in every segment before using this new path.
+                if read and read.confidence >= .8:
+                    return read
+            if bright and threshold == 120:
+                continue  # Lower-threshold components are only for the strict path.
+            boxes = sorted(b for b in components if b[3] >= .4*h)
             if not 3 <= len(boxes) <= 18:
                 continue
             splits = [(boxes[i][0] - max(x+bw for x,y,bw,bh in boxes[:i]), i)
@@ -317,13 +454,43 @@ class EasyOCREngine:
                                        (serial, '0123456789', 6), (digit, '0123456789', 1)]:
             x1 = min(b[0] for b in group); y1 = min(b[1] for b in group)
             x2 = max(b[0]+b[2] for b in group); y2 = max(b[1]+b[3] for b in group)
-            if length == 1 and group[0][2] > np.median([b[3] for b in serial])*.5:
-                # Remove a printed rectangle around the actual check digit.
-                dx, dy = max(2, int((x2-x1)*.15)), max(2, int((y2-y1)*.15))
-                x1 += dx; x2 -= dx; y1 += dy; y2 -= dy
-            part = image[max(0,y1-2):min(h,y2+2), max(0,x1-2):min(w,x2+2)]
+            part = image[max(0,y1-3):min(h,y2+3), max(0,x1-3):min(w,x2+3)]
+            if length == 1:
+                from app.ocr.container_ocr import rectify_printed_digit_box
+                rectified = rectify_printed_digit_box(part)
+                if rectified is not None:
+                    part = rectified
+            else:
+                # Keep the established padding for owner and serial segments.
+                part = image[max(0,y1-2):min(h,y2+2), max(0,x1-2):min(w,x2+2)]
+            if length == 1 and part.shape[0] < 48 and part.shape[1] < .65*part.shape[0]:
+                # Very narrow isolated digits are compressed by the recognizer's
+                # fixed-height normalization. Resample the actual printed glyph.
+                import cv2
+                part = cv2.resize(part, (int(part.shape[1]*4.5), part.shape[0]*3),
+                                  interpolation=cv2.INTER_CUBIC)
             items = self.reader.recognize(part, detail=1, allowlist=allowed)
             text = ''.join(str(item[1]) for item in items).replace(' ', '')
+            if len(text) != length and len(group) == length:
+                import cv2
+                chars, confs = [], []
+                for gb in group:
+                    gx, gy, gw, gh = gb
+                    gpart = image[max(0,gy-2):min(h,gy+gh+2), max(0,gx-2):min(w,gx+gw+2)]
+                    if length == 1:
+                        unboxed = rectify_printed_digit_box(gpart)
+                        if unboxed is not None:
+                            gpart = unboxed
+                    if gpart.shape[1] < gpart.shape[0] * 0.7:
+                        pad_x = int((gpart.shape[0] * 0.7 - gpart.shape[1]) / 2) + 10
+                        gpart = cv2.copyMakeBorder(gpart, 4, 4, pad_x, pad_x, cv2.BORDER_CONSTANT, value=(70,70,70))
+                    g_items = self.reader.recognize(gpart, detail=1, allowlist=allowed)
+                    if g_items:
+                        chars.append(str(g_items[0][1]))
+                        confs.append(float(g_items[0][2]))
+                if len(chars) == length:
+                    text = ''.join(chars)
+                    items = [('', text, min(confs) if confs else 0.8)]
             if len(text) != length:
                 return None
             pieces.append((text, min(float(item[2]) for item in items)))
@@ -339,7 +506,7 @@ class EasyOCREngine:
         if image is None or getattr(image, 'size', 0) == 0:
             return OCRRead('', 0.0)
 
-        segmented = self._read_segmented_number(image)
+        segmented = self._read_stacked_number(image) or self._read_vertical_number(image) or self._read_segmented_number(image)
         if segmented:
             return segmented
         h, w = image.shape[:2]

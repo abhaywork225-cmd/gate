@@ -37,6 +37,8 @@ class GateEvent(Base):
     container_number: Mapped[Optional[str]] = mapped_column(String(11))
     event_type: Mapped[str] = mapped_column(String(10))
     status: Mapped[str] = mapped_column(String(20))
+    visit_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    capture_policy: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     is_twin: Mapped[bool] = mapped_column(Boolean, default=False)
     container_number_2: Mapped[Optional[str]] = mapped_column(String(11), nullable=True)
     iso_code_1: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)

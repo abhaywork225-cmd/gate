@@ -77,8 +77,15 @@ class Settings(BaseSettings):
     database_url: SecretStr = SecretStr('sqlite+pysqlite:///data/gate.db')
     cameras_file: Path = Path('config/cameras.yaml')
     pipeline_enabled: bool = True
+    vehicle_visit_tracking: bool = True
+    minimum_number_proof_cameras: int = Field(default=2, ge=1, le=16)
+    shared_visit_folders: bool = True
+    container_roi_trigger: bool = True
+    reversal_grace_seconds: float = Field(default=30, ge=0, le=300)
+    cross_camera_arrival_window_seconds: float = Field(default=30, ge=1, le=120)
     model_backend: Literal['pytorch', 'onnx', 'tensorrt'] = 'pytorch'
     model_path: Path = Path('models/best.pt')
+    vehicle_presence_min_confidence: float = Field(default=0.5, ge=0.5, le=1)
     passage_vehicle_model_path: Path = Path('models/yolov8x.pt')
     model_device: str = 'cpu'
     model_image_size: int = Field(default=640, ge=32)

@@ -218,3 +218,31 @@ def test_container_number_alone_triggers_occupancy(settings, camera):
     assert selected.class_name == 'container_number'
     assert view.current is not None
     assert view.status()['state'] in ('TRACKING', 'OCCUPIED')
+
+
+def test_observation_gap_restarts_slot_stationary_timer(settings, camera):
+    view = ViewOccupancy(settings)
+    view.update(camera, *measured(0))
+    view.update(camera, *measured(1))
+    assert view.current.slots['FRONT'].stationary
+    view.update(camera, *measured(1 + settings.gate_observation_gap_seconds + 1))
+    assert not view.current.slots['FRONT'].stationary
+
+
+def test_approaching_box_with_fixed_center_is_not_stationary(settings, camera):
+    view = ViewOccupancy(settings)
+    view.update(camera, *measured(0))
+    view.update(camera, *measured(1, ((15,15,75,85),)))
+    assert not view.current.slots['FRONT'].stationary
+
+
+def test_visible_truck_keeps_visit_when_number_marking_disappears(settings,camera):
+    view = ViewOccupancy(settings)
+    view.update(camera,*measured(0))
+    origin = view.current.origin
+    for t in range(1,20):
+        frame,_ = measured(t)
+        vehicle = Detection(camera.id,frame.timestamp,'truck',.9,(10,10,90,90))
+        view.update(camera,frame,[vehicle])
+    assert view.current.origin == origin
+    assert view.current.clear_since is None

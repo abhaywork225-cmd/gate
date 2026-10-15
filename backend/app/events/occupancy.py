@@ -31,6 +31,25 @@ def center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 
+def concurrent_visits(first, second, window_seconds):
+    """Recent frame activity alone cannot associate two truck arrivals."""
+    if not first or not second or first.clear_since is not None or second.clear_since is not None:
+        return False
+    return abs((first.first_seen - second.first_seen).total_seconds()) <= window_seconds
+
+
+def same_vehicle_pair(first, second, detections, shape):
+    """Two number markings need a common measured vehicle, not just a lane."""
+    points = (center(first), center(second))
+    for detection in detections:
+        if detection.class_name not in ('truck', 'trailer', 'vehicle') or detection.confidence < .60:
+            continue
+        box = normalized(detection.bbox, shape)
+        if all(box[0] <= x <= box[2] and box[1] <= y <= box[3] for x, y in points):
+            return True
+    return False
+
+
 @dataclass
 class ContainerSlot:
     slot_id: str  # 'FRONT' or 'REAR'
@@ -45,6 +64,7 @@ class ContainerSlot:
     container_number: str | None = None
     closed: bool = False
     clear_since: object = None
+    stationary_bbox: tuple | None = None
 
 
 @dataclass
@@ -98,8 +118,14 @@ class ViewOccupancy:
     def _update_slot(self, slot, b, now):
         point = center(b)
         drift = hypot(point[0] - slot.anchor[0], point[1] - slot.anchor[1])
-        if drift >= self.settings.stationary_drift_threshold:
+        reference = slot.stationary_bbox or slot.bbox
+        slot.stationary_bbox = reference
+        old_w, old_h = reference[2]-reference[0], reference[3]-reference[1]
+        new_w, new_h = b[2]-b[0], b[3]-b[1]
+        scale_change = max(abs(new_w-old_w)/max(old_w, 1e-6), abs(new_h-old_h)/max(old_h, 1e-6))
+        if drift >= self.settings.stationary_drift_threshold or scale_change > .05:
             slot.anchor, slot.stationary_since, slot.stationary = point, now, False
+            slot.stationary_bbox = b
         else:
             slot.stationary = (now - slot.stationary_since).total_seconds() >= self.settings.stationary_seconds
         slot.bbox = b
@@ -136,6 +162,13 @@ class ViewOccupancy:
             if not any(containment(b, ex[1]) > 0.5 for ex in candidates):
                 candidates.append((d, b))
 
+        # Text markings can disappear or move on one truck. A visible vehicle
+        # keeps the visit alive even when no eligible text box is measured.
+        visible_in_zone = visible_in_zone or any(
+            d.class_name in ('truck', 'trailer', 'vehicle') and
+            iou(normalized(d.bbox, frame.image.shape), zone) > .02
+            for d in detections)
+
         state = self.current
         if state and state.source_id != frame.source_id:
             self.current = state = None  # Explicit source/calibration generation change.
@@ -145,14 +178,15 @@ class ViewOccupancy:
             # full clear interval. If a single stationary visit is followed by
             # a clearly separate detection, hand off to a fresh occupancy
             # origin instead of attaching the new vehicle to the old event.
-            if state.stationary and not state.is_twin and state.bbox and candidates:
+            if (state.stationary or (state.closed and camera.gate_exit_axis is not None)) and not state.is_twin and state.bbox and candidates:
                 front_candidate = max(candidates, key=lambda item: box_area(item[1]))
                 candidate_box = front_candidate[1]
                 separate = iou(state.bbox, candidate_box) < 0.10
                 axis = 1 if camera.gate_exit_axis == 'y' else 0
                 distance = abs(center(state.bbox)[axis] - center(candidate_box)[axis])
-                eligible = front_candidate[0].class_name in ('container', 'container_number', 'iso_code')
-                if eligible and separate and distance >= 0.25:
+                aligned = abs(center(state.bbox)[1-axis] - center(candidate_box)[1-axis]) < .20
+                eligible = front_candidate[0].class_name in ('container', 'container_number')
+                if eligible and separate and aligned and distance >= 0.25:
                     self.current = None
                     return self.update(camera, frame, detections)
             gap = (now - state.last_measured).total_seconds()
@@ -162,9 +196,19 @@ class ViewOccupancy:
                 state.clear_since = None
                 state.stationary_since = now
                 state.stationary = False
+                for slot in state.slots.values():
+                    slot.stationary_since = now
+                    slot.stationary = False
+                    slot.anchor = center(slot.bbox)
+                    slot.stationary_bbox = slot.bbox
             state.last_measured = now
 
             if not candidates:
+                # Remember the measured departure position even though boxes
+                # beyond the clearance line are excluded from OCR candidates.
+                departed = [(d,b) for d,b in all_boxes if self._past_exit(b, camera)]
+                if len(departed) == 1 and not state.is_twin and 'FRONT' in state.slots:
+                    self._update_slot(state.slots['FRONT'], departed[0][1], now)
                 if visible_in_zone:
                     state.clear_since = None
                     return None
@@ -205,7 +249,8 @@ class ViewOccupancy:
                             c1[0].class_name == 'container_number' and
                             c2[0].class_name == 'container_number' and
                             area_1 >= 0.0015 and area_2 >= 0.0015 and
-                            c1[0].confidence >= 0.60 and c2[0].confidence >= 0.60
+                            c1[0].confidence >= 0.60 and c2[0].confidence >= 0.60 and
+                            same_vehicle_pair(c1[1], c2[1], detections, frame.image.shape)
                         )
                         if is_body_twin or is_text_twin:
                             if sep > max_sep:
@@ -258,19 +303,20 @@ class ViewOccupancy:
                             else:
                                 self._update_slot(front_slot, b, now)
                 elif front_slot:
-                    is_sequential_twin = (
+                    is_next_arrival = (
                         camera.gate_exit_axis is not None and
                         self._past_exit(front_slot.bbox, camera) and
                         not self._past_exit(b, camera) and
                         iou(front_slot.bbox, b) < 0.20 and
                         abs(center(front_slot.bbox)[axis] - center(b)[axis]) >= 0.25
                     )
-                    if is_sequential_twin:
-                        state.is_twin = True
-                        state.closed = False
-                        state.slots['REAR'] = ContainerSlot('REAR', f'{state.origin}:rear', b, center(b), now, now, now, event_id=state.event_id)
-                    else:
-                        self._update_slot(front_slot, b, now)
+                    if is_next_arrival:
+                        # A new text box after the previous box cleared the
+                        # boundary can be the next truck, not a second box on
+                        # the same chassis. Start a fresh visit.
+                        self.current = None
+                        return self.update(camera, frame, detections)
+                    self._update_slot(front_slot, b, now)
 
             # Synchronize master state properties
             state.stationary = any(s.stationary for s in state.slots.values()) if state.slots else False
@@ -354,7 +400,8 @@ class ViewOccupancy:
                     c1[0].class_name == 'container_number' and
                     c2[0].class_name == 'container_number' and
                     area_1 >= 0.0015 and area_2 >= 0.0015 and
-                    c1[0].confidence >= 0.60 and c2[0].confidence >= 0.60
+                    c1[0].confidence >= 0.60 and c2[0].confidence >= 0.60 and
+                    same_vehicle_pair(c1[1], c2[1], detections, frame.image.shape)
                 )
                 if is_body_twin or is_text_twin:
                     if sep > max_sep:

@@ -315,6 +315,6 @@
 
   <footer>
     <span>GateVision · Industrial Gate Module POC</span>
-    <span>Site: Panvel CFS · Prosper API Cloud Sync Active · Local time: UTC+05:30</span>
+    <span>Site: Panvel CFS · Cloud: {{ cloudSync()?.enabled ? (cloudSync()?.is_paused ? 'Sending paused' : 'Enabled') : 'Disabled' }} · Local time: UTC+05:30</span>
   </footer>
 </main>

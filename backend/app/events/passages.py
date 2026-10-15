@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from uuid import uuid4
 import cv2
 import numpy as np
+import math
 
 from app.detection.tracker import TemporalTracker, iou, similar, same_colour, appearance
 
@@ -416,7 +417,9 @@ class PassageCollector:
             region.vote_sequences.setdefault(number,set()).add(sequence)
             x1,y1,x2,y2 = map(int,job.detection.bbox)
             crop = job.frame.image[max(0,y1):y2,max(0,x1):x2]
-            quality = float(cv2.Laplacian(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),cv2.CV_64F).var()) if crop.size else 0
+            var = float(cv2.Laplacian(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),cv2.CV_64F).var()) if crop.size else 0
+            box_area = max(1.0, float((x2 - x1) * (y2 - y1)))
+            quality = var * math.log1p(box_area)
             previous = region.reads.get(number)
             if previous:
                 old_validation, old_job = previous
@@ -569,7 +572,17 @@ def final_captures(group, confirmations):
         for number,records in numbers.items())
     base = min((p.visit_id or p.id for p in group))
     plans = []
-    bundles = [list(numbers)] if reliable_twin else [[n] for n in sorted(numbers)]
+    confirmed_numbers = {n: records for n, records in numbers.items() if sum(c for _, _, c in records) >= confirmations}
+    if reliable_twin:
+        bundles = [list(numbers)]
+    elif confirmed_numbers:
+        bundles = [[n] for n in sorted(confirmed_numbers)]
+    elif numbers:
+        best_candidate = max(numbers, key=lambda n: sum(c for _, _, c in numbers[n]))
+        bundles = [[best_candidate]]
+    else:
+        bundles = []
+
     for bundle in bundles:
         regions = [r for n in bundle for _,r,_ in numbers[n]]
         owners = [p for n in bundle for p,_,_ in numbers[n]]
@@ -578,14 +591,9 @@ def final_captures(group, confirmations):
         plans.append(replace(first,id=identity,regions=regions,ambiguous=False,
                              final_evidence=True,closed=True))
     # If the only evidence is unreadable, keep one source per camera for a
-    # concurrent visit. If known identities coexist, unknown regions stay
-    # separate instead of borrowing a known container's number or proof.
-    unknown_bundles = [[entry] for entry in unknown] if numbers else ([unknown] if unknown else [])
-    if numbers:
-        # One unreadable observer of an otherwise identified visit is not an
-        # additional container. Retain an unknown slot only when a common
-        # measured chassis actually has multiple number regions.
-        unknown_bundles = [[(p,r)] for p,r in unknown if p.chassis_observed and len(p.regions)>1 and not r.context_only]
+    # concurrent visit. If known identities coexist, unreadable text on the same
+    # passage is evidence of the container, not an additional container.
+    unknown_bundles = [unknown] if (not numbers and unknown) else []
     for entries in unknown_bundles:
         first = min((p for p,_ in entries),key=lambda p:(p.started,p.id))
         key = ':'.join(sorted(p.id+':'+r.id for p,r in entries))
