@@ -166,7 +166,7 @@ class GateRepository:
         policy = 'FINAL_CAPTURE' if numbers else 'UNREADABLE_CAPTURE'
         confirmed = bool(numbers) and all(
             sum(e['votes'].values()) >= confirmations or
-            (sum(e['votes'].values()) >= 1 and any(v.valid_check_digit and v.confidence >= 0.80 for v,_ in e['proofs'].values()))
+            (sum(e['votes'].values()) >= 1 and any(v.valid_check_digit and v.confidence >= 0.50 for v,_ in e['proofs'].values()))
             for e in entries.values()
         )
         status = 'CONFIRMED' if confirmed else ('CAPTURED' if numbers else 'UNREADABLE')
@@ -178,6 +178,7 @@ class GateRepository:
             with self._write_lock,self.db.sessions.begin() as session:
                 if session.get(GateEvent,passage.id):
                     return passage.id
+                best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
                 if numbers:
                     recent = session.execute(
                         select(GateEvent).where(
@@ -237,7 +238,82 @@ class GateRepository:
                                     existing_snaps.add(matched_cam)
                             snapshots.save_event_json(existing.id,self.event(existing.id))
                             return existing.id
-                best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
+                    # Upgrade recent UNREADABLE event on the same lane to this identified container
+                    recent_unreadable = session.execute(
+                        select(GateEvent).where(
+                            GateEvent.lane_id == passage.lane_id,
+                            GateEvent.container_number.is_(None)
+                        ).order_by(GateEvent.timestamp.desc())
+                    ).scalars().all()
+                    for unreadable_ev in recent_unreadable:
+                        if abs((passage.started - unreadable_ev.timestamp).total_seconds()) <= 60.0:
+                            unreadable_ev.container_number = numbers[0]
+                            unreadable_ev.container_number_2 = numbers[1] if twin else None
+                            unreadable_ev.is_twin = twin
+                            unreadable_ev.status = status
+                            unreadable_ev.capture_policy = policy
+                            unreadable_ev.iso_code_1 = best[0].size_type if best else None
+                            unreadable_ev.iso_code_2 = best[1].size_type if twin else None
+                            existing_snaps = {s.camera_id for s in session.execute(
+                                select(Snapshot).where(Snapshot.event_id == unreadable_ev.id)
+                            ).scalars().all()}
+                            bundles = [(n,entries[n]['proofs']) for n in numbers]
+                            for index,(number,proofs) in enumerate(bundles):
+                                for camera_id,(validation,job) in proofs.items():
+                                    if camera_id not in existing_snaps:
+                                        detection_id,snapshot_id = str(uuid4()),str(uuid4())
+                                        proof_folder = unreadable_ev.visit_id or unreadable_ev.id
+                                        path = snapshots.save_side_snapshot(proof_folder,
+                                            f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                                        created.append(path)
+                                        session.add(DetectionRecord(id=detection_id,event_id=unreadable_ev.id,camera_id=camera_id,
+                                            origin_key=f'final:{unreadable_ev.id}:{snapshot_id}',track_id=job.track_id,
+                                            class_name=job.detection.class_name,confidence=job.detection.confidence,
+                                            bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
+                                        session.flush()
+                                        session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
+                                            raw_text=validation.raw_text,normalized_text=number or '',
+                                            confidence=validation.confidence if number else 0,
+                                            valid_format=bool(number),valid_check_digit=bool(number),
+                                            validation_status=validation.validation_status if number else 'UNREADABLE'))
+                                        session.add(Snapshot(id=snapshot_id,event_id=unreadable_ev.id,camera_id=camera_id,
+                                            image_path=path,timestamp=job.frame.timestamp))
+                                        existing_snaps.add(camera_id)
+                            snapshots.save_event_json(unreadable_ev.id,self.event(unreadable_ev.id))
+                            return unreadable_ev.id
+                else:
+                    # Suppress unreadable duplicate if a recent event already exists on this lane
+                    recent_lane_events = session.execute(
+                        select(GateEvent).where(
+                            GateEvent.lane_id == passage.lane_id
+                        ).order_by(GateEvent.timestamp.desc())
+                    ).scalars().all()
+                    for existing in recent_lane_events:
+                        if abs((passage.started - existing.timestamp).total_seconds()) <= 60.0:
+                            existing_snaps = {s.camera_id for s in session.execute(
+                                select(Snapshot).where(Snapshot.event_id == existing.id)
+                            ).scalars().all()}
+                            for camera_id,(validation,job) in unreadable.items():
+                                if camera_id not in existing_snaps:
+                                    detection_id,snapshot_id = str(uuid4()),str(uuid4())
+                                    proof_folder = existing.visit_id or existing.id
+                                    path = snapshots.save_side_snapshot(proof_folder,
+                                        f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                                    created.append(path)
+                                    session.add(DetectionRecord(id=detection_id,event_id=existing.id,camera_id=camera_id,
+                                        origin_key=f'final:{existing.id}:{snapshot_id}',track_id=job.track_id,
+                                        class_name=job.detection.class_name,confidence=job.detection.confidence,
+                                        bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
+                                    session.flush()
+                                    session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
+                                        raw_text=validation.raw_text,normalized_text='',
+                                        confidence=0,valid_format=False,valid_check_digit=False,
+                                        validation_status='UNREADABLE'))
+                                    session.add(Snapshot(id=snapshot_id,event_id=existing.id,camera_id=camera_id,
+                                        image_path=path,timestamp=job.frame.timestamp))
+                                    existing_snaps.add(camera_id)
+                            snapshots.save_event_json(existing.id,self.event(existing.id))
+                            return existing.id
                 session.add(GateEvent(id=passage.id,gate_id=passage.gate_id,lane_id=passage.lane_id,
                     timestamp=passage.started,event_type=passage.direction,status=status,capture_policy=policy,visit_id=visit_id,
                     container_number=numbers[0] if numbers else None,

@@ -949,7 +949,7 @@ class GateRuntime:
                 def _region_confirmed(r):
                     if r.confirmed(self.settings.ocr_confirmations):
                         return True
-                    return any(getattr(v, 'valid_check_digit', False) and getattr(v, 'confidence', 0) >= 0.80
+                    return any(getattr(v, 'valid_check_digit', False) and getattr(v, 'confidence', 0) >= 0.50
                                for v, _ in r.reads.values())
                 complete = bool(text_regions) and all(not r.pending and _region_confirmed(r) for r in text_regions)
                 expected = {c.id for c in self.cameras if c.enabled and c.gate_id==group[0].gate_id}
