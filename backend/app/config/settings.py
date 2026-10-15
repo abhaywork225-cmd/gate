@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     cameras_file: Path = Path('config/cameras.yaml')
     pipeline_enabled: bool = True
     vehicle_visit_tracking: bool = True
-    minimum_number_proof_cameras: int = Field(default=2, ge=1, le=16)
+    minimum_number_proof_cameras: int = Field(default=1, ge=1, le=16)
     shared_visit_folders: bool = True
     container_roi_trigger: bool = True
     reversal_grace_seconds: float = Field(default=30, ge=0, le=300)
