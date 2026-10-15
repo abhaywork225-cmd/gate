@@ -182,7 +182,7 @@ class GateRepository:
                         ).order_by(GateEvent.timestamp.desc())
                     ).scalars().all()
                     for existing in recent:
-                        if abs((passage.started - existing.timestamp).total_seconds()) <= 60.0:
+                        if abs((passage.started - existing.timestamp).total_seconds()) <= 900.0:
                             existing_snaps = {s.camera_id for s in session.execute(
                                 select(Snapshot).where(Snapshot.event_id == existing.id)
                             ).scalars().all()}
@@ -207,6 +207,28 @@ class GateRepository:
                                             validation_status=validation.validation_status if number else 'UNREADABLE'))
                                         session.add(Snapshot(id=snapshot_id,event_id=existing.id,camera_id=camera_id,
                                             image_path=path,timestamp=job.frame.timestamp))
+                                        existing_snaps.add(camera_id)
+                            # Attach companion camera context images if that camera is not yet in snapshots
+                            proof_folder = existing.visit_id or existing.id
+                            visit_dir = snapshots.path(proof_folder)
+                            if visit_dir.is_dir():
+                                for ctx_file in sorted(visit_dir.glob('*_context_*.jpg')):
+                                    cam_id = ctx_file.name.split('_context_')[0]
+                                    if cam_id not in existing_snaps:
+                                        snap_id = str(uuid4())
+                                        det_id = str(uuid4())
+                                        rel_path = f'{proof_folder}/{ctx_file.name}'
+                                        session.add(DetectionRecord(
+                                            id=det_id, event_id=existing.id, camera_id=cam_id,
+                                            origin_key=f'final:{existing.id}:{snap_id}', track_id=-1,
+                                            class_name='context_roi', confidence=1.0,
+                                            bbox=[0.0, 0.0, 2560.0, 1440.0], timestamp=existing.timestamp
+                                        ))
+                                        session.add(Snapshot(
+                                            id=snap_id, event_id=existing.id, camera_id=cam_id,
+                                            image_path=rel_path, timestamp=existing.timestamp
+                                        ))
+                                        existing_snaps.add(cam_id)
                             snapshots.save_event_json(existing.id,self.event(existing.id))
                             return existing.id
                 best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
@@ -218,6 +240,7 @@ class GateRepository:
                     iso_code_2=best[1].size_type if twin else None))
                 session.flush()
                 bundles = [(n,entries[n]['proofs']) for n in numbers] or [(None,unreadable)]
+                saved_snaps = set()
                 for index,(number,proofs) in enumerate(bundles):
                     for camera_id,(validation,job) in proofs.items():
                         detection_id,snapshot_id = str(uuid4()),str(uuid4())
@@ -237,6 +260,28 @@ class GateRepository:
                             validation_status=validation.validation_status if number else 'UNREADABLE'))
                         session.add(Snapshot(id=snapshot_id,event_id=passage.id,camera_id=camera_id,
                             image_path=path,timestamp=job.frame.timestamp))
+                        saved_snaps.add(camera_id)
+                # Attach companion camera context images if that camera is not yet in snapshots
+                proof_folder = visit_id or passage.id
+                visit_dir = snapshots.path(proof_folder)
+                if visit_dir.is_dir():
+                    for ctx_file in sorted(visit_dir.glob('*_context_*.jpg')):
+                        cam_id = ctx_file.name.split('_context_')[0]
+                        if cam_id not in saved_snaps:
+                            snap_id = str(uuid4())
+                            det_id = str(uuid4())
+                            rel_path = f'{proof_folder}/{ctx_file.name}'
+                            session.add(DetectionRecord(
+                                id=det_id, event_id=passage.id, camera_id=cam_id,
+                                origin_key=f'final:{passage.id}:{snap_id}', track_id=-1,
+                                class_name='context_roi', confidence=1.0,
+                                bbox=[0.0, 0.0, 2560.0, 1440.0], timestamp=passage.started
+                            ))
+                            session.add(Snapshot(
+                                id=snap_id, event_id=passage.id, camera_id=cam_id,
+                                image_path=rel_path, timestamp=passage.started
+                            ))
+                            saved_snaps.add(cam_id)
                 session.add(SystemLog(id=str(uuid4()),event_id=passage.id,level='INFO',
                     event_name='container_capture_finalized',context={'lane_id':passage.lane_id,
                     'identities':numbers,'status':status,'visit_id':passage.visit_id or passage.id}))
