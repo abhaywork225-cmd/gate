@@ -945,8 +945,13 @@ class GateRuntime:
             for group in self.passages.groups():
                 if any(p.saved for p in group):
                     continue
-                complete = all(p.regions and all(not r.pending and
-                    r.confirmed(self.settings.ocr_confirmations) for r in p.regions) for p in group)
+                text_regions = [r for p in group for r in p.regions if not r.context_only]
+                def _region_confirmed(r):
+                    if r.confirmed(self.settings.ocr_confirmations):
+                        return True
+                    return any(getattr(v, 'valid_check_digit', False) and getattr(v, 'confidence', 0) >= 0.80
+                               for v, _ in r.reads.values())
+                complete = bool(text_regions) and all(not r.pending and _region_confirmed(r) for r in text_regions)
                 expected = {c.id for c in self.cameras if c.enabled and c.gate_id==group[0].gate_id}
                 number_cameras = {}
                 for p in group:
@@ -954,7 +959,7 @@ class GateRuntime:
                         for number,proofs in region.source_proofs.items():
                             number_cameras.setdefault(number,set()).update(proofs)
                 coverage = bool(number_cameras) and all(len(cams)>=self.settings.minimum_number_proof_cameras for cams in number_cameras.values())
-                early = self.settings.vehicle_visit_tracking and complete and coverage and expected.issubset({p.camera_id for p in group})
+                early = self.settings.vehicle_visit_tracking and complete and coverage
                 departed = all(p.closed and (not self.settings.vehicle_visit_tracking or p.closed_at is None or
                     (utcnow()-p.closed_at).total_seconds()>=self.settings.reversal_grace_seconds) and
                     all(not r.pending and (not r.candidates or r.confirmed(self.settings.ocr_confirmations))
@@ -981,6 +986,21 @@ class GateRuntime:
                         # Proofs have been copied to durable event snapshots.
                         self.ocr_store.retain_origin_proof(job.origin_key,job.frame.sequence)
                     self.dispatcher.enqueue(None,event_id,delay_seconds=0)
+                    if plan.direction in ('EXIT', 'OUT', 'GATE_OUT'):
+                        try:
+                            saved_ev = self.repository.event(event_id)
+                            cntr = (saved_ev or {}).get('container_number')
+                            self.emit_alert(
+                                alert_type='GATE_OUT',
+                                title='Gate OUT Movement',
+                                message=f'Container {cntr or "Detected"} exiting on lane {plan.lane_id}',
+                                level='INFO',
+                                container_number=cntr,
+                                event_id=event_id,
+                                buzzer=True
+                            )
+                        except Exception:
+                            pass
                 for p in group:
                     for region in p.regions:
                         if id(region) not in retained:

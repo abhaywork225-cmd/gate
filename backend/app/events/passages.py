@@ -560,7 +560,7 @@ def final_captures(group, confirmations):
                 numbers.setdefault(number,[]).append((passage,region,count))
             elif region.best_any:
                 unknown.append((passage,region))
-        if not passage.regions and passage.context:
+        if not numbers and not passage.regions and passage.context:
             # Runtime persists this context as an explicit unreadable job before
             # finalization; a missing detector number must not drop the visit.
             raise ValueError('Departure context has not been persisted')
@@ -573,8 +573,15 @@ def final_captures(group, confirmations):
         any(str(region.reads[number][0].size_type or '').startswith('2') for _,region,_ in records)
         for number,records in numbers.items())
     base = min((p.visit_id or p.id for p in group))
-    plans = []
-    confirmed_numbers = {n: records for n, records in numbers.items() if sum(c for _, _, c in records) >= confirmations}
+    confirmed_numbers = {
+        n: records for n, records in numbers.items()
+        if sum(c for _, _, c in records) >= confirmations or (
+            sum(c for _, _, c in records) >= 1 and any(
+                r.reads.get(n) and getattr(r.reads[n][0], 'valid_check_digit', False) and getattr(r.reads[n][0], 'confidence', 0) >= 0.80
+                for _, r, _ in records
+            )
+        )
+    }
     if reliable_twin:
         bundles = [list(numbers)]
     elif confirmed_numbers:
@@ -585,6 +592,7 @@ def final_captures(group, confirmations):
     else:
         bundles = []
 
+    plans = []
     for bundle in bundles:
         regions = [r for n in bundle for _,r,_ in numbers[n]]
         owners = [p for n in bundle for p,_,_ in numbers[n]]
