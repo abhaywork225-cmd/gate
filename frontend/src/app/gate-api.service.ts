@@ -20,6 +20,29 @@ export interface LaneRegion { id: string; polygon: number[][]; }
 export interface LaneCalibration { camera_id: string; occupancy_roi: number[]; lanes?: LaneRegion[]; entry_line: number; exit_line: number; gate_exit_axis: 'x' | 'y' | null; gate_exit_positive: boolean; gate_clear_seconds?: number; version: number; }
 export interface CameraSource { id: string; name: string; host?: string; configured: boolean; discovered?: boolean; connection_hint?: string; }
 export interface DiscoveryStatus { state: string; found: number; message: string; }
+export interface WaitingCandidate {
+  container_number: string;
+  votes: number;
+  confidence: number;
+  status: string;
+}
+
+export interface WaitingPassage {
+  id: string;
+  visit_id: string;
+  gate_id: string;
+  lane_id: string;
+  camera_id: string;
+  direction: string;
+  started: string;
+  last_seen: string;
+  dwell_seconds: number;
+  status: string;
+  candidates: WaitingCandidate[];
+  folder: string;
+  folder_path: string;
+}
+
 export interface GateEvent {
   visit_id?: string | null;
   candidate_number?: string | null;
@@ -41,6 +64,8 @@ export interface GateEvent {
   cloud_synced?: boolean;
   cloud_synced_at?: string | null;
   cloud_event_id?: string | null;
+  folder?: string;
+  folder_path?: string;
 }
 export interface Detection { id?: string; camera_id: string; class_name: string; confidence: number; bbox: number[]; timestamp?: string; frame_timestamp?: string; track_id?: number; }
 export interface OCR { id: string; raw_text: string; normalized_text: string; confidence: number; validation_status: string; }
@@ -129,11 +154,15 @@ export class GateApi {
   alerts() { return this.http.get<SystemAlert[]>('/api/alerts'); }
   testBuzzer(pattern: string = 'gate_out') { return this.http.post('/api/alerts/test?pattern=' + encodeURIComponent(pattern), {}); }
   clearAlerts() { return this.http.post('/api/alerts/clear', {}); }
-  events(offset: number, container: string, type: string) {
+  events(offset: number, container: string, type: string, folder?: string) {
     let params = new HttpParams().set('limit', 25).set('offset', offset);
     if (container.trim()) params = params.set('container', container.trim().toUpperCase());
     if (type) params = params.set('event_type', type);
+    if (folder && folder !== 'all') params = params.set('folder', folder);
     return this.http.get<EventPage>('/api/gate-events', {params});
+  }
+  waitingPassages() {
+    return this.http.get<{items: WaitingPassage[]; total: number}>('/api/waiting-passages');
   }
   event(id: string) { return this.http.get<EventDetail>(`/api/gate-events/${encodeURIComponent(id)}`); }
   eventJsonUrl(id: string) { return `/api/gate-events/${encodeURIComponent(id)}/json`; }

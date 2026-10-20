@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     # PaddleOCR runs in its own CUDA worker so it does not contend with the
     # PyTorch YOLO process. Qwen remains a last-resort reader only.
     ocr_engine: Literal['paddleocr', 'olmocr', 'easyocr', 'qwen2_vl', 'qwen2vl'] = 'paddleocr'
-    ocr_fallback_engine: Literal['olmocr', 'easyocr', 'none'] = 'olmocr'
+    ocr_fallback_engine: Literal['olmocr', 'easyocr', 'none'] = 'none'
     paddle_ocr_detection_model: str = 'PP-OCRv6_medium_det'
     paddle_ocr_recognition_model: str = 'PP-OCRv6_medium_rec'
     ocr_model_name: str = 'Qwen/Qwen2-VL-2B-Instruct'
@@ -151,6 +151,7 @@ class Settings(BaseSettings):
     same_container_event_window_seconds: float = Field(default=600, ge=60, le=7200)
     track_ttl_seconds: float = Field(default=5, gt=0)
     snapshot_directory: Path = Path('snapshots')
+    categorized_snapshot_folders: bool = True
     upload_directory: Path = Path('uploads')
     log_directory: Path = Path('logs')
     max_upload_mb: int = Field(default=2048, ge=1, le=20480)

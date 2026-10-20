@@ -140,3 +140,47 @@ def test_review_event_can_display_matching_proof_without_becoming_dispatchable(s
         assert {p['camera_id'] for p in result['cloud_proof_images']} == {'camera-1', 'camera-2'}
         assert not result['cloud_synced']
         dispatcher.dispatch_event.assert_not_called()
+
+
+def test_categorized_folders_and_waiting_passages_api(tmp_path, settings, repository, camera, make_job):
+    from app.snapshots.snapshot_manager import SnapshotManager
+    cat_root = tmp_path / 'cat_snapshots'
+    cat_snapshots = SnapshotManager(cat_root, categorized=True)
+    assert (cat_root / 'waiting').is_dir()
+    assert (cat_root / 'detected_in').is_dir()
+    assert (cat_root / 'detected_out').is_dir()
+
+    # Stage a waiting passage
+    visit_id = 'test-visit-123'
+    cat_snapshots.ensure_event_dir(visit_id, category='waiting')
+    assert (cat_root / 'waiting' / visit_id).is_dir()
+
+    import numpy as np
+    dummy_img = np.zeros((100, 150, 3), dtype=np.uint8)
+    cat_snapshots.save_side_snapshot(f'waiting/{visit_id}', 'gate-in-1', dummy_img)
+    assert (cat_root / 'waiting' / visit_id / 'gate-in-1.jpg').is_file()
+
+    # Promote to detected_in
+    target_cat = cat_snapshots.promote_from_waiting(visit_id, direction='ENTRY')
+    assert target_cat == 'detected_in'
+    assert (cat_root / 'detected_in' / visit_id / 'gate-in-1.jpg').is_file()
+    assert not (cat_root / 'waiting' / visit_id).exists()
+
+    # Test API endpoint
+    app = create_app(settings, repository.db, [camera])
+    with TestClient(app) as client:
+        # Check /api/waiting-passages returns list
+        resp = client.get('/api/waiting-passages')
+        assert resp.status_code == 200
+        assert 'items' in resp.json()
+        assert resp.json()['total'] == 0
+
+        # Check /api/gate-events with folder parameter
+        resp_in = client.get('/api/gate-events?folder=detected_in')
+        assert resp_in.status_code == 200
+        resp_out = client.get('/api/gate-events?folder=detected_out')
+        assert resp_out.status_code == 200
+        resp_wait = client.get('/api/gate-events?folder=waiting')
+        assert resp_wait.status_code == 200
+        assert 'items' in resp_wait.json()
+

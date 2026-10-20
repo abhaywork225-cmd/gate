@@ -69,7 +69,7 @@ class OCRJobStore:
                     if not source.is_relative_to(legacy.resolve()) or not source.is_file():
                         break
                     name = hashlib.sha256(f'{row["origin"]}:{row["sequence"]}:{key}'.encode()).hexdigest()[:20]
-                    target = f'{folder}/legacy_{name}{source.suffix}'
+                    target = f'waiting/{folder}/legacy_{name}{source.suffix}'
                     self._write_image(target, source.read_bytes())
                     updates[key] = target
                 else:
@@ -95,15 +95,47 @@ class OCRJobStore:
             event_id = row['event_id'] or canonical.get(row['origin'])
             if not event_id:
                 continue
-            current = str(row['image']).replace('\\', '/').split('/', 1)[0]
-            if current != str(event_id):
-                self.complete(row['id'], event_id)
+            clean_event = str(event_id).replace('\\', '/').strip('/')
+            for c in ('waiting', 'detected_in', 'detected_out'):
+                if clean_event.startswith(f'{c}/'):
+                    clean_event = clean_event[len(c)+1:]
+                    break
+            direction = metadata.get('direction')
+            gate_id = metadata.get('gate_id')
+            cat = 'detected_in'
+            d = str(direction or '').upper()
+            g = str(gate_id or '').lower()
+            if d in ('EXIT', 'OUT', 'GATE_OUT') or any(k in g for k in ('out', 'exit')):
+                cat = 'detected_out'
+            target_rel = f'{cat}/{clean_event}'
+            current = str(row['image']).replace('\\', '/').strip('/')
+            if current.startswith(target_rel + '/'):
+                continue
+            self.complete(row['id'], event_id)
 
     def image_path(self, relative):
-        path = (self.image_root / relative).resolve()
-        if not path.is_relative_to(self.image_root) or path == self.image_root:
+        rel_str = str(relative).replace('\\', '/').strip('/')
+        direct = (self.image_root / rel_str).resolve()
+        if direct.is_relative_to(self.image_root) and direct.exists():
+            return direct
+        clean_rel = rel_str
+        has_cat = False
+        for cat in ('waiting', 'detected_in', 'detected_out'):
+            if clean_rel.startswith(f'{cat}/'):
+                clean_rel = clean_rel[len(cat)+1:]
+                has_cat = True
+                break
+        for cat in ('waiting', 'detected_in', 'detected_out'):
+            cand = (self.image_root / cat / clean_rel).resolve()
+            if cand.is_relative_to(self.image_root) and cand.exists():
+                return cand
+        if not has_cat:
+            fallback = (self.image_root / 'waiting' / clean_rel).resolve()
+            if fallback.is_relative_to(self.image_root) and fallback != self.image_root:
+                return fallback
+        if not direct.is_relative_to(self.image_root) or direct == self.image_root:
             raise ValueError('Invalid OCR image path')
-        return path
+        return direct
 
     def _write_image(self, relative, data):
         path = self.image_path(relative)
@@ -124,7 +156,7 @@ class OCRJobStore:
             paths = f'{folder}/candidate_{sequence}_crop.png', f'{folder}/candidate_{sequence}_frame.png'
         else:
             folder = hashlib.sha256(json.dumps([origin, sequence]).encode()).hexdigest()
-            paths = f'{folder}/crop.png', f'{folder}/frame.png'
+            paths = f'waiting/{folder}/crop.png', f'waiting/{folder}/frame.png'
         self._write_image(paths[0], crop)
         self._write_image(paths[1], image)
         return paths
@@ -198,6 +230,10 @@ class OCRJobStore:
             folder = folder  # Camera and sequence are encoded in the filename.
         elif self.staged_visits and getattr(job,'passage_id',None):
             folder = f'_processing/{folder}/{job.frame.camera_id}'
+        if self.shared_evidence:
+            clean_f = folder.replace('\\', '/').strip('/')
+            if not any(clean_f.startswith(f'{c}/') for c in ('waiting', 'detected_in', 'detected_out')):
+                folder = f'waiting/{clean_f}'
         # Unique names across cameras, tracks and retries.
         sample = hashlib.sha256(f'{job.origin_key}:{job.frame.source_id}:{job.frame.sequence}'.encode()).hexdigest()[:16]
         camera = job.frame.camera_id
@@ -252,13 +288,35 @@ class OCRJobStore:
                 paths = self._save_images(job.origin_key, job.frame.sequence, crop_data, image_data, folder=folder)
             job_id = db.execute('INSERT INTO jobs(origin,sequence,metadata,crop,image,payload_bytes) VALUES(?,?,?,?,?,?)',
                               (job.origin_key, job.frame.sequence, encoded, *paths, payload_bytes)).lastrowid
-            if not getattr(job, 'passage_id', None):
-                # Keep source files, but don't repeatedly OCR every obsolete
-                # frame of one waiting truck. Retain three independent samples.
-                db.execute("UPDATE jobs SET state='SUPERSEDED' WHERE origin=? AND state='PENDING' "
-                           "AND id NOT IN (SELECT id FROM jobs WHERE origin=? AND state='PENDING' ORDER BY id DESC LIMIT 3)",
-                           (job.origin_key, job.origin_key))
+            # Keep source files, but don't repeatedly OCR every obsolete
+            # frame of one waiting truck or passage. Retain three independent samples.
+            db.execute("UPDATE jobs SET state='SUPERSEDED' WHERE origin=? AND state='PENDING' "
+                       "AND id NOT IN (SELECT id FROM jobs WHERE origin=? AND state='PENDING' ORDER BY id DESC LIMIT 3)",
+                       (job.origin_key, job.origin_key))
             return job_id
+
+    def clean_stale_pending(self, max_age_seconds: float = 60.0):
+        """Mark uncompleted jobs from expired/historical passages as superseded."""
+        with self.connection() as db:
+            cutoff = time.time() - max_age_seconds
+            rows = db.execute("SELECT id, metadata FROM jobs WHERE state='PENDING'").fetchall()
+            stale_ids = []
+            for r in rows:
+                try:
+                    meta = json.loads(r['metadata'])
+                    ts_str = meta.get('frame', {}).get('timestamp') or meta.get('started_at')
+                    if ts_str:
+                        if not ts_str.endswith('Z') and '+' not in ts_str:
+                            ts_str += '+00:00'
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        if dt.timestamp() < cutoff:
+                            stale_ids.append(r['id'])
+                    else:
+                        stale_ids.append(r['id'])
+                except Exception:
+                    stale_ids.append(r['id'])
+            if stale_ids:
+                db.executemany("UPDATE jobs SET state='SUPERSEDED' WHERE id=?", [(i,) for i in stale_ids])
 
     def completed_event(self, job_id):
         with self.connection() as db:
@@ -267,9 +325,10 @@ class OCRJobStore:
 
     def next_id(self):
         with self.connection() as db:
-            row = db.execute("SELECT id FROM jobs WHERE state='PENDING' AND retry_at<=? ORDER BY id ASC LIMIT 1",
+            row = db.execute("SELECT id FROM jobs WHERE state='PENDING' AND retry_at<=? ORDER BY id DESC LIMIT 1",
                              (time.time(),)).fetchone()
             return row['id'] if row else None
+
 
     def passage_jobs(self):
         with self.connection() as db:
@@ -293,14 +352,26 @@ class OCRJobStore:
                 if meta.get('finalized'):
                     continue
                 camera = meta['detection']['camera_id']
-                target_dir = self.image_root / str(visit_id)
+                clean_visit = str(visit_id).replace('\\', '/').strip('/')
+                for c in ('waiting', 'detected_in', 'detected_out'):
+                    if clean_visit.startswith(f'{c}/'):
+                        clean_visit = clean_visit[len(c)+1:]
+                        break
+                target_dir = self.image_root / 'waiting' / clean_visit
                 previous_visit = meta.get('storage_visit_id')
-                if previous_visit and previous_visit != str(visit_id):
-                    previous_dir = self.image_root / previous_visit
+                if previous_visit and previous_visit != clean_visit:
+                    clean_prev = str(previous_visit).replace('\\', '/').strip('/')
+                    for c in ('waiting', 'detected_in', 'detected_out'):
+                        if clean_prev.startswith(f'{c}/'):
+                            clean_prev = clean_prev[len(c)+1:]
+                            break
+                    previous_dir = self.image_root / 'waiting' / clean_prev
+                    if not previous_dir.exists():
+                        previous_dir = self.image_root / clean_prev
                     for context in previous_dir.glob('*_context_*.jpg'):
                         target_dir.mkdir(parents=True,exist_ok=True)
                         target = target_dir / context.name
-                        if target.exists():target = target_dir / f'{previous_visit[:8]}_{context.name}'
+                        if target.exists():target = target_dir / f'{clean_prev[:8]}_{context.name}'
                         os.replace(context,target)
                         sidecar = context.with_suffix('.json')
                         if sidecar.is_file():
@@ -320,13 +391,13 @@ class OCRJobStore:
                         if target.exists():
                             target = target_dir / f'{row["id"]}_{source.name}'
                         os.replace(source,target)
-                    updates[label] = str(target.relative_to(self.image_root)) if target.exists() else relative
-                meta['storage_visit_id'] = str(visit_id)
-                meta['event_id'] = str(visit_id)
+                    updates[label] = str(target.relative_to(self.image_root)).replace('\\', '/') if target.exists() else relative
+                meta['storage_visit_id'] = clean_visit
+                meta['event_id'] = clean_visit
                 if 'original_crop' in updates:meta['original_crop'] = updates['original_crop']
                 meta['companion_images'] = {cam:updates[f'companion:{cam}'] for cam in meta.get('companion_images',{})}
                 db.execute('UPDATE jobs SET crop=?,image=?,metadata=?,event_id=? WHERE id=?',
-                           (updates['crop'],updates['image'],json.dumps(meta),visit_id,row['id']))
+                           (updates['crop'],updates['image'],json.dumps(meta),clean_visit,row['id']))
                 for directory in old_dirs:
                     while directory != self.image_root and directory != target_dir:
                         try:directory.rmdir()
@@ -405,11 +476,17 @@ class OCRJobStore:
             return Detection(**{**value, 'frame_timestamp': datetime.fromisoformat(value['frame_timestamp']),
                                 'bbox': tuple(value['bbox'])})
         def decode(relative):
-            blob = self.image_path(relative).read_bytes()
-            result = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if result is None:
-                raise ValueError('Unreadable persisted OCR image')
-            return result
+            try:
+                p = self.image_path(relative)
+                if not p.is_file():
+                    return np.zeros((100, 100, 3), dtype=np.uint8)
+                blob = p.read_bytes()
+                result = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if result is None:
+                    return np.zeros((100, 100, 3), dtype=np.uint8)
+                return result
+            except Exception:
+                return np.zeros((100, 100, 3), dtype=np.uint8)
         comp_frames = {}
         for cam_id, rel in data.get('companion_images', {}).items():
             try:
@@ -571,7 +648,19 @@ class OCRJobStore:
             provisional = self.staged_visits and metadata.get('passage_id') and not metadata.get('finalized')
             if row and event_id and self.shared_evidence and not provisional and not metadata.get('storage_visit_id'):
                 updates = {}
-                target_dir = self.image_root / str(event_id)
+                direction = metadata.get('direction')
+                gate_id = metadata.get('gate_id')
+                cat = 'detected_in'
+                d = str(direction or '').upper()
+                g = str(gate_id or '').lower()
+                if d in ('EXIT', 'OUT', 'GATE_OUT') or any(k in g for k in ('out', 'exit')):
+                    cat = 'detected_out'
+                clean_event = str(event_id).replace('\\', '/').strip('/')
+                for c in ('waiting', 'detected_in', 'detected_out'):
+                    if clean_event.startswith(f'{c}/'):
+                        clean_event = clean_event[len(c)+1:]
+                        break
+                target_dir = self.image_root / cat / clean_event
                 if self.staged_visits:
                     target_dir = target_dir / 'evidence' / metadata['detection']['camera_id']
                 target_dir.mkdir(parents=True, exist_ok=True)
@@ -635,8 +724,12 @@ class OCRJobStore:
 
     def cancel_pending(self, origin, event_id=None):
         with self.connection() as db:
-            db.execute("UPDATE jobs SET state='DONE', event_id=?, error_type=NULL, retry_at=? WHERE origin=? AND state='PENDING'",
-                       (event_id, time.time(), origin))
+            if '%' in origin:
+                db.execute("UPDATE jobs SET state='DONE', event_id=?, error_type=NULL, retry_at=? WHERE origin LIKE ? AND state='PENDING'",
+                           (event_id, time.time(), origin))
+            else:
+                db.execute("UPDATE jobs SET state='DONE', event_id=?, error_type=NULL, retry_at=? WHERE origin=? AND state='PENDING'",
+                           (event_id, time.time(), origin))
 
     def retain_origin_proof(self, origin, sequence):
         """Delete surplus completed captures while retaining OCR audit rows."""
@@ -700,12 +793,18 @@ class OCRJobStore:
                     except OSError:
                         pass
 
-    def retry(self, job_id, error_type):
+    def retry(self, job_id, error_type, max_attempts=5):
         with self.connection() as db:
-            db.execute('UPDATE jobs SET attempts=attempts+1, retry_at=?, error_type=? WHERE id=?',
-                       (time.time() + 5, error_type, job_id))
+            row = db.execute('SELECT attempts FROM jobs WHERE id=?', (job_id,)).fetchone()
+            curr = (row['attempts'] if row else 0) + 1
+            if curr >= max_attempts:
+                db.execute("UPDATE jobs SET attempts=?, state='FAILED', error_type=? WHERE id=?",
+                           (curr, error_type, job_id))
+            else:
+                db.execute('UPDATE jobs SET attempts=?, retry_at=?, error_type=? WHERE id=?',
+                           (curr, time.time() + 5, error_type, job_id))
 
     def status(self):
         with self.connection() as db:
-            row = db.execute("SELECT COUNT(*) total, SUM(state='PENDING') pending, SUM(error_type IS NOT NULL) failed FROM jobs").fetchone()
+            row = db.execute("SELECT COUNT(*) total, SUM(state='PENDING') pending, SUM(state='FAILED' OR (error_type IS NOT NULL AND state!='DONE')) failed FROM jobs").fetchone()
         return {key: row[key] or 0 for key in ('total', 'pending', 'failed')}

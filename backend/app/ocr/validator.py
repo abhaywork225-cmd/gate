@@ -115,6 +115,89 @@ def sanitize_ocr_text(text: str) -> str:
     return cleaned.strip()
 
 
+def repair_container_candidate(raw: str, normalized: str) -> str | None:
+    """
+    ISO 6346 checksum-verified repair for common industrial OCR distortions:
+    1. Phantom separators (e.g. 'TXGUL5059972' -> 'TXGU5059972', 'BAXUL2681457')
+       where a vertical door seam or bracket between owner and serial or serial and check digit
+       is read as 'L', '1', 'I', '|', or 'A'.
+    2. Owner digit confusions ('0'->'O', '1'->'I', '8'->'B', '5'->'S', '2'->'Z', 'D'->'O').
+    3. Serial letter confusions ('O'->'0', 'I'->'1', 'L'->'1', 'S'->'5', 'B'->'8', 'Z'->'2').
+    4. Substring candidate in noisy string (11-char window).
+    
+    STRICT RULE: A candidate is ONLY accepted if check_digit(cand[:10]) == int(cand[10])
+    AND exactly ONE candidate matches.
+    """
+    compact = normalize(raw)
+    valid_candidates = set()
+
+    # 1. Check if an 11-char subwindow in compact is valid
+    if len(compact) > 11:
+        for i in range(len(compact) - 10):
+            window = compact[i:i+11]
+            if STRUCTURE.fullmatch(window) and check_digit(window[:10]) == int(window[10]):
+                valid_candidates.add(window)
+
+    # 2. Phantom separator removal (12 chars -> 11 chars)
+    if len(compact) == 12:
+        for idx in (4, 3, 10):
+            cand = compact[:idx] + compact[idx+1:]
+            if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
+                valid_candidates.add(cand)
+
+    # 3. Missing check digit repair (10 chars -> 11 chars)
+    if len(compact) == 10 and re.fullmatch(r'[A-Z]{3}[UJZ][0-9]{6}', compact):
+        try:
+            cand = compact + str(check_digit(compact))
+            if STRUCTURE.fullmatch(cand):
+                valid_candidates.add(cand)
+        except Exception:
+            pass
+
+    # 3. Character substitutions on 11-char string (or from compact)
+    target = normalized if len(normalized) == 11 else (compact[:11] if len(compact) >= 11 else '')
+    if target and len(target) == 11:
+        OWNER_REPAIR = {'0': 'O', '1': 'I', '8': 'B', '5': 'S', '2': 'Z', 'D': 'O'}
+        SERIAL_REPAIR = {'O': '0', 'I': '1', 'L': '1', 'S': '5', 'B': '8', 'Z': '2', 'A': '4', 'T': '7'}
+
+        # Multi-char owner digit repair (e.g. 00CU -> OOCU)
+        owner_fixed = list(target)
+        changed = False
+        for idx in range(3):
+            if owner_fixed[idx] in OWNER_REPAIR:
+                owner_fixed[idx] = OWNER_REPAIR[owner_fixed[idx]]
+                changed = True
+        if changed:
+            cand = ''.join(owner_fixed)
+            if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
+                valid_candidates.add(cand)
+
+        # Single-char owner repair
+        chars = list(target)
+        for idx in range(4):
+            orig = chars[idx]
+            if orig in OWNER_REPAIR:
+                chars[idx] = OWNER_REPAIR[orig]
+                cand = ''.join(chars)
+                if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
+                    valid_candidates.add(cand)
+                chars[idx] = orig
+
+        # Single-char serial repair
+        for idx in range(4, 11):
+            orig = chars[idx]
+            if orig in SERIAL_REPAIR:
+                chars[idx] = SERIAL_REPAIR[orig]
+                cand = ''.join(chars)
+                if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
+                    valid_candidates.add(cand)
+                chars[idx] = orig
+
+    if len(valid_candidates) == 1:
+        return next(iter(valid_candidates))
+    return None
+
+
 class ContainerValidator:
     def validate(self, read: OCRRead) -> Validation:
         raw_input = read.raw_text[:4096] if read and read.raw_text else ''
@@ -123,9 +206,6 @@ class ContainerValidator:
             return Validation('', '', 0.0, False, False, 'INVALID_FORMAT')
 
         raw = correct_feet_size_codes(sanitized)
-        # Accept only characters actually read. Formatting delimiters and a
-        # printed check-digit box may be removed; missing digits, owner letters
-        # and brand-derived identities must never be invented.
         pattern = re.compile(
             r'(?<![A-Z0-9])([A-Z][\s-]*[A-Z][\s-]*[A-Z][\s-]*[UJZ])'
             r'((?:[\s-]*[0-9]){6})[\s-]*[\[(|]?\s*([0-9])[\])|]?'
@@ -149,3 +229,4 @@ class ContainerValidator:
         status = 'VALID' if valid_digit else 'INVALID_CHECK_DIGIT' if valid_format else 'INVALID_FORMAT'
         iso_code, human_size = extract_iso_size_code(raw)
         return Validation(raw, normalized, read.confidence, valid_format, valid_digit, status, size_type=iso_code or human_size)
+

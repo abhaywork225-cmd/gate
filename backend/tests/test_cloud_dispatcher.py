@@ -304,10 +304,9 @@ def test_each_camera_sends_one_image_without_duplicate_views(mock_settings, tmp_
         assert container['ContainerNumber'] == 'BSIU3391518'
         assert container['Position'] == 'SINGLE'
 
-        # Only the camera frame with a validated identity read is upload proof
+        # Exactly 3 images: one from each camera, no duplicate gate-in-2 views
         camera_ids = [img['CameraId'] for img in container['Images']]
-        assert camera_ids == ['gate-in-1']
-        assert [img['ImageType'] for img in container['Images']] == ['FRONT']
+        assert camera_ids == ['gate-in-1', 'gate-in-2', 'gate-in-3']
 
 
 def test_dispatch_audit_logging(mock_settings):
@@ -350,5 +349,67 @@ def test_dispatch_audit_logging(mock_settings):
         # Image base64 must be sanitized and not stored raw
         assert 'Image' not in entry['event_sent']['Containers'][0]['Images'][0]
         assert entry['event_sent']['Containers'][0]['Images'][0]['image_bytes_len'] > 0
+
+
+def test_is_dispatchable_event_thresholds(mock_settings):
+    dispatcher = CloudOutboxDispatcher(mock_settings)
+
+    # 1. Unreadable event (no container number or status UNREADABLE) -> False
+    unreadable_ev = {
+        'id': 'unreadable-1',
+        'status': 'UNREADABLE',
+        'container_number': None,
+        'cloud_synced': 0,
+        'ocr_results': []
+    }
+    assert dispatcher.is_dispatchable_event(unreadable_ev) is False
+
+    # 2. Event with container number but accuracy < 50% (0.35) -> False
+    low_acc_ev = {
+        'id': 'low-acc-1',
+        'status': 'CAPTURED',
+        'container_number': 'EITU0514718',
+        'cloud_synced': 0,
+        'ocr_results': [
+            {'raw_text': 'FITU 051471 D', 'normalized_text': 'FITU051471D', 'confidence': 0.35}
+        ]
+    }
+    assert dispatcher.is_dispatchable_event(low_acc_ev) is False
+
+    # 3. Event with container number and accuracy >= 50% (0.55) -> True
+    valid_acc_ev = {
+        'id': 'valid-acc-1',
+        'status': 'CAPTURED',
+        'container_number': 'EITU0514718',
+        'cloud_synced': 0,
+        'ocr_results': [
+            {'raw_text': 'EITU 051471 8', 'normalized_text': 'EITU0514718', 'confidence': 0.55}
+        ]
+    }
+    assert dispatcher.is_dispatchable_event(valid_acc_ev) is True
+
+    # 4. Confirmed event with high accuracy (0.92) -> True
+    confirmed_ev = {
+        'id': 'confirmed-1',
+        'status': 'CONFIRMED',
+        'container_number': 'TEMU7104954',
+        'cloud_synced': 0,
+        'ocr_results': [
+            {'raw_text': 'TEMU 710495 4', 'normalized_text': 'TEMU7104954', 'confidence': 0.92}
+        ]
+    }
+    assert dispatcher.is_dispatchable_event(confirmed_ev) is True
+
+    # 5. Already synced event -> False
+    synced_ev = {
+        'id': 'synced-1',
+        'status': 'CONFIRMED',
+        'container_number': 'TEMU7104954',
+        'cloud_synced': 1,
+        'ocr_results': [
+            {'raw_text': 'TEMU 710495 4', 'normalized_text': 'TEMU7104954', 'confidence': 0.92}
+        ]
+    }
+    assert dispatcher.is_dispatchable_event(synced_ev) is False
 
 

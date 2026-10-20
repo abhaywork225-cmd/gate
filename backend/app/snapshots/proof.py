@@ -1,12 +1,10 @@
 from __future__ import annotations
 """Derived inspection image; never change the original captured evidence."""
-import re
-
 import cv2
 import numpy as np
 
 
-def proof_jpeg(data: bytes, snapshot: dict, event: dict) -> bytes:
+def proof_jpeg(data: bytes, snapshot: dict = None, event: dict = None) -> bytes:
     """
     Return clean, high-resolution camera photo without artificial black canvases,
     side panel crops, or debug text overlays.
@@ -20,4 +18,3 @@ def proof_jpeg(data: bytes, snapshot: dict, event: dict) -> bytes:
     if not ok:
         raise ValueError('Proof image cannot be encoded as JPEG')
     return encoded.tobytes()
-

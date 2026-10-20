@@ -43,111 +43,106 @@ def _paddle_text(payload: dict) -> tuple[str, float]:
     return '\n'.join(lines), (sum(values) / len(values) if values else 0.0)
 
 
-def _paddle_worker(requests, responses, use_gpu: bool, detection_model: str, recognition_model: str):
-    """Dedicated Paddle/CUDA process.
-
-    PyTorch YOLO and Paddle link different CUDA/cuDNN builds on Windows. Keeping
-    Paddle in this child process preserves GPU acceleration without destabilising
-    the live PyTorch detector.
-    """
-    try:
-        import site
-        for package_dir in site.getsitepackages():
-            dll_dir = os.path.join(package_dir, 'nvidia', 'cu13', 'bin', 'x86_64')
-            if os.path.isdir(dll_dir):
-                if hasattr(os, 'add_dll_directory'):
-                    os.add_dll_directory(dll_dir)
-                os.environ['PATH'] = dll_dir + os.pathsep + os.environ.get('PATH', '')
-        import paddle
-        # PaddleX imports ModelScope only to discover optional remote model
-        # sources. Loading its PyTorch helpers would reintroduce the DLL clash.
-        sys.modules['modelscope'] = types.ModuleType('modelscope')
-        os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
-        from paddleocr import PaddleOCR
-        if use_gpu and not paddle.is_compiled_with_cuda():
-            raise RuntimeError('GPU OCR requested, but Paddle has no CUDA support')
-        device = 'gpu:0' if use_gpu else 'cpu'
-        paddle.set_device(device)
-        engine = PaddleOCR(
-            text_detection_model_name=detection_model,
-            text_recognition_model_name=recognition_model,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
-        responses.put(('ready', True, device))
-    except BaseException as exc:
-        responses.put(('ready', False, f'{type(exc).__name__}: {exc}'))
-        return
-    while True:
-        request = requests.get()
-        if request is None:
-            return
-        request_id, image = request
-        try:
-            output = list(engine.predict(image))
-            payload = output[0].json if output else {}
-            text, confidence = _paddle_text(payload)
-            # Handle vertical text crops (e.g. ECMU 5580439 on vertical corner post)
-            if hasattr(image, 'shape') and len(image.shape) >= 2:
-                h, w = image.shape[:2]
-                if h > 1.25 * w or (not text.strip() and h > w):
-                    try:
-                        import cv2
-                        rot_img = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                        rot_out = list(engine.predict(rot_img))
-                        rot_payload = rot_out[0].json if rot_out else {}
-                        rot_text, rot_conf = _paddle_text(rot_payload)
-                        if (not text.strip() and rot_text.strip()) or rot_conf > confidence:
-                            text, confidence = rot_text, rot_conf
-                    except Exception:
-                        pass
-            responses.put(('result', request_id, text, confidence, None))
-        except BaseException as exc:
-            responses.put(('result', request_id, '', 0.0, f'{type(exc).__name__}: {exc}'))
-
-
 class PaddleOCREngine:
-    """PP-OCRv6 primary reader backed by a persistent, GPU-only worker."""
-    def __init__(self, settings):
-        self._lock, self._sequence = threading.Lock(), 0
-        self._context = get_context('spawn')
-        self._requests = self._context.Queue(maxsize=1)
-        self._responses = self._context.Queue(maxsize=1)
-        self._process = self._context.Process(
-            target=_paddle_worker,
-            args=(self._requests, self._responses, bool(settings.ocr_gpu),
-                  settings.paddle_ocr_detection_model, settings.paddle_ocr_recognition_model),
-            name='gate-paddle-ocr', daemon=True,
-        )
-        self._process.start()
-        try:
-            kind, ready, detail = self._responses.get(timeout=90)
-        except queue_module.Empty as exc:
-            self.close()
-            raise RuntimeError('PaddleOCR GPU worker did not start within 90 seconds') from exc
-        if kind != 'ready' or not ready:
-            self.close()
-            raise RuntimeError(f'PaddleOCR GPU worker failed: {detail}')
-        self.device = detail
-        log.info('paddle_ocr_ready', extra={'device': self.device})
+    """PP-OCRv4 reader backed by RapidOCR (ONNX Runtime / TensorRT)."""
+    def __init__(self, settings=None):
+        self._lock = threading.Lock()
+        from pathlib import Path
+        from rapidocr_onnxruntime import RapidOCR
+        # Initialize RapidOCR with CPU fallback session
+        self.engine = RapidOCR(intra_op_num_threads=6, inter_op_num_threads=2)
+        
+        # Accelerate with TensorRT GPU engines if available
+        use_gpu = getattr(settings, 'ocr_gpu', True)
+        is_trt = False
+        if use_gpu:
+            rec_engine = None
+            for p in (Path('models/rec_ppocrv4.engine'), Path('backend/models/rec_ppocrv4.engine')):
+                if p.is_file():
+                    rec_engine = p
+                    break
+            det_engine = None
+            for p in (Path('models/det_ppocrv4.engine'), Path('backend/models/det_ppocrv4.engine')):
+                if p.is_file():
+                    det_engine = p
+                    break
+            if rec_engine is not None:
+                try:
+                    from app.ocr.trt_session import TensorRTInferSession
+                    self.engine.text_rec.session = TensorRTInferSession(
+                        rec_engine, fallback_session=self.engine.text_rec.session
+                    )
+                    is_trt = True
+                    log.info('paddle_ocr_trt_rec_active', extra={'engine': str(rec_engine)})
+                    if det_engine is not None:
+                        self.engine.text_det.infer = TensorRTInferSession(
+                            det_engine, fallback_session=self.engine.text_det.infer
+                        )
+                        log.info('paddle_ocr_trt_det_active', extra={'engine': str(det_engine)})
+                except Exception as e:
+                    log.warning('paddle_ocr_trt_init_failed', extra={'error': str(e)})
+
+        log.info('paddle_ocr_ready', extra={'engine': 'rapidocr_tensorrt' if is_trt else 'rapidocr_onnxruntime'})
+
 
     def read(self, image) -> OCRRead:
-        if image is None or getattr(image, 'size', 0) == 0 or not self._process.is_alive():
+        if image is None or getattr(image, 'size', 0) == 0:
             return OCRRead('', 0.0)
         with self._lock:
-            self._sequence += 1
-            request_id = self._sequence
-            try:
-                self._requests.put((request_id, image), timeout=2)
-                kind, returned_id, text, confidence, error = self._responses.get(timeout=20)
-            except queue_module.Empty:
-                log.warning('paddle_ocr_timeout')
-                return OCRRead('', 0.0)
-            if kind != 'result' or returned_id != request_id or error:
-                log.warning('paddle_ocr_read_failed', extra={'error': error or 'unexpected response'})
-                return OCRRead('', 0.0)
-            return OCRRead(text[:4096], float(confidence))
+            from app.ocr.validator import ContainerValidator, repair_container_candidate
+            validator = ContainerValidator()
+
+            def _check_or_repair(txt: str, conf: float):
+                if not txt:
+                    return '', 0.0, False
+                v = validator.validate(OCRRead(txt, conf))
+                if v.valid_check_digit:
+                    return v.normalized_text, conf, True
+                rep = repair_container_candidate(txt, v.normalized_text)
+                if rep:
+                    rep_v = validator.validate(OCRRead(rep, conf))
+                    if rep_v.valid_check_digit:
+                        return rep, conf, True
+                return txt, conf, False
+
+            # 1. Fast path: Direct crop recognition without sub-detection (~35ms)
+            res_rec, _ = self.engine(image, use_det=False)
+            best_txt, best_conf = '', 0.0
+            if res_rec and res_rec[0]:
+                raw_txt = str(res_rec[0][0] or '').strip()
+                conf = float(res_rec[0][1] or 0.0)
+                final_txt, final_conf, is_valid = _check_or_repair(raw_txt, conf)
+                if is_valid:
+                    return OCRRead(final_txt, final_conf)
+                best_txt, best_conf = final_txt, final_conf
+
+            # 2. Check vertical crops: rotate 90 degrees CCW / CW
+            h, w = image.shape[:2]
+            if h > 1.25 * w:
+                import cv2
+                for rot in (cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_90_CLOCKWISE):
+                    rot_img = cv2.rotate(image, rot)
+                    r_res, _ = self.engine(rot_img, use_det=False)
+                    if r_res and r_res[0]:
+                        r_txt = str(r_res[0][0] or '').strip()
+                        r_conf = float(r_res[0][1] or 0.0)
+                        final_txt, final_conf, is_valid = _check_or_repair(r_txt, r_conf)
+                        if is_valid:
+                            return OCRRead(final_txt, final_conf)
+                        if r_conf > best_conf:
+                            best_txt, best_conf = final_txt, final_conf
+
+            # 3. Fallback: Full text detection + recognition
+            res_det, _ = self.engine(image, use_det=True)
+            if res_det:
+                txt, conf = _extract_text_from_items(res_det)
+                final_txt, final_conf, is_valid = _check_or_repair(txt, conf)
+                if is_valid:
+                    return OCRRead(final_txt, final_conf)
+                if conf > best_conf or len(txt) > len(best_txt):
+                    best_txt, best_conf = final_txt, final_conf
+
+            return OCRRead(best_txt, best_conf)
 
     def read_iso(self, image) -> OCRRead:
         import re
@@ -161,16 +156,7 @@ class PaddleOCREngine:
         return OCRRead(match.group(1) if match else '', result.confidence if match else 0.0)
 
     def close(self):
-        if not getattr(self, '_process', None):
-            return
-        if self._process.is_alive():
-            try:
-                self._requests.put_nowait(None)
-                self._process.join(timeout=5)
-            except Exception:
-                pass
-        if self._process.is_alive():
-            self._process.terminate()
+        pass
 
 
 class FallbackOCREngine:

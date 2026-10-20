@@ -10,6 +10,7 @@ import { Camera, CameraSource, GateApi, PlaybackAction, UploadState } from './ga
     @for (camera of cameras(); track camera.id; let index = $index) {
       <article class="camera-card" [attr.aria-label]="camera.name">
         <div class="card-heading"><span class="camera-number">0{{ index + 1 }}</span><div class="camera-name"><strong>{{ camera.name }}</strong><small>{{ camera.gate_id }} · {{ camera.direction }}</small></div>
+          <button type="button" class="btn-virtual-line" (click)="openCalibration.emit(camera.id)" title="Configure Virtual Laser Line and Detection Area">⚡ Virtual Line & ROI</button>
           <span class="badge" [class.good]="camera.status === 'ONLINE'" [class.warn]="camera.status === 'RECONNECTING'">{{ camera.source_type === 'file' ? camera.playback_status : camera.status }}</span></div>
         <label class="source-selector"><span>Camera source</span><select [disabled]="!!busy()[camera.id] || stale()" (change)="selectSource($event, camera.id)">
           <option value="" disabled [selected]="!camera.active_source_id">Select a camera</option>
@@ -132,6 +133,7 @@ export class CameraGridComponent {
 
   roles = [{value: 'UNASSIGNED', label: 'Unassigned'}, {value: 'FRONT_TOP', label: 'Front / Top'}, {value: 'LEFT', label: 'Left'}, {value: 'RIGHT', label: 'Right'}, {value: 'REAR', label: 'Rear'}];
   roleChange = output<{id: string; role: string; direction: string}>();
+  openCalibration = output<string>();
   cameras = input<Camera[]>([]);
   cameraSources = input<CameraSource[]>([]);
   inferenceFps = input<Partial<Record<string, number>>>({});

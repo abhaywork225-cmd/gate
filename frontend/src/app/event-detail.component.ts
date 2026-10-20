@@ -318,7 +318,7 @@ export class EventDetailComponent {
   }
 
   dispatchToSite(item: EventDetail) {
-    if (!item?.id || this.dispatching() || !this.cloudEnabled() || (item.status !== 'CONFIRMED' && item.capture_policy !== 'BEST_AVAILABLE')) return;
+    if (!item?.id || this.dispatching() || !this.cloudEnabled() || (item.status !== 'CONFIRMED' && !['BEST_AVAILABLE', 'FINAL_CAPTURE', 'UNREADABLE_CAPTURE'].includes(item.capture_policy || ''))) return;
     this.dispatching.set(true);
     this.dispatchMessage.set(null);
 
@@ -331,12 +331,22 @@ export class EventDetailComponent {
         if (res.cloud_event_id) {
           item.cloud_event_id = res.cloud_event_id;
         }
+        setTimeout(() => {
+          if (this.dispatchSuccess()) {
+            this.dispatchMessage.set(null);
+          }
+        }, 5000);
       },
       error: (err) => {
         this.dispatching.set(false);
         this.dispatchSuccess.set(false);
         const detail = err?.error?.detail || err?.error?.message || err?.message || 'Failed to dispatch event to site';
         this.dispatchMessage.set('⚠ Error: ' + detail);
+        setTimeout(() => {
+          if (this.dispatchMessage()?.startsWith('⚠ Error:')) {
+            this.dispatchMessage.set(null);
+          }
+        }, 8000);
       }
     });
   }

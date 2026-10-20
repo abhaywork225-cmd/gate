@@ -7,12 +7,26 @@ from app.snapshots.proof import proof_jpeg
 router = APIRouter(prefix='/api', tags=['events'])
 
 
+@router.get('/waiting-passages')
+def waiting_passages(request: Request):
+    runtime = getattr(request.app.state, 'runtime', None)
+    if not runtime or not hasattr(runtime, 'get_waiting_passages'):
+        return {'items': [], 'total': 0}
+    items = runtime.get_waiting_passages()
+    return {'items': items, 'total': len(items)}
+
+
 @router.get('/gate-events')
 def events(request: Request, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
            container: str | None = Query(None, max_length=11), camera_id: str | None = None,
            event_type: Literal['ENTRY', 'EXIT', 'UNKNOWN'] | None = None,
-           status: Literal['CONFIRMED', 'NEEDS_REVIEW', 'CAPTURED', 'UNREADABLE'] | None = None):
-    return request.app.state.repository.events(limit, offset, container, camera_id, event_type, status)
+           status: Literal['CONFIRMED', 'NEEDS_REVIEW', 'CAPTURED', 'UNREADABLE'] | None = None,
+           folder: Literal['detected_in', 'detected_out', 'waiting', 'all'] | None = None):
+    if folder == 'waiting':
+        runtime = getattr(request.app.state, 'runtime', None)
+        items = runtime.get_waiting_passages() if runtime and hasattr(runtime, 'get_waiting_passages') else []
+        return {'items': items, 'total': len(items), 'limit': limit, 'offset': 0}
+    return request.app.state.repository.events(limit, offset, container, camera_id, event_type, status, folder=folder)
 
 
 @router.get('/gate-events/{event_id}')
@@ -104,11 +118,18 @@ def event_json(event_id: str, request: Request):
     result = request.app.state.repository.event(event_id)
     if result is None:
         raise HTTPException(404, 'Event not found')
+    folder = result.get('folder') or ('detected_out' if str(result.get('event_type') or '').upper() in ('EXIT', 'OUT', 'GATE_OUT') else 'detected_in')
     visit_id = result.get('visit_id')
-    relative = f'{visit_id}/event_{event_id}.json' if visit_id else f'{event_id}/event.json'
+    raw_id = visit_id or event_id
+    relative = f'{folder}/{raw_id}/event_{event_id}.json' if visit_id else f'{folder}/{raw_id}/event.json'
     json_path = request.app.state.snapshots.path(relative)
     if not json_path.is_file():
-        json_path = request.app.state.snapshots.save_event_json(event_id, result)
+        flat_relative = f'{raw_id}/event_{event_id}.json' if visit_id else f'{raw_id}/event.json'
+        flat_path = request.app.state.snapshots.path(flat_relative)
+        if flat_path.is_file():
+            json_path = flat_path
+        else:
+            json_path = request.app.state.snapshots.save_event_json(event_id, result)
     return FileResponse(json_path, media_type='application/json', filename=f'event_{event_id}.json')
 
 

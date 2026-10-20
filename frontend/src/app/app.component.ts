@@ -1,10 +1,10 @@
 import { Component, computed, DestroyRef, inject, signal } from '@angular/core';
-import { DatePipe } from '@angular/common';
+import { DatePipe, DecimalPipe } from '@angular/common';
 import { HttpErrorResponse, HttpEventType } from '@angular/common/http';
 import { FormsModule } from '@angular/forms';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { catchError, exhaustMap, forkJoin, merge, of, Subject, timer, timeout } from 'rxjs';
-import { GateApi, Camera, CameraSource, EventPage, EventDetail, Health, Metrics, UploadState, PlaybackAction, SystemAlert, CloudSyncStatus } from './gate-api.service';
+import { GateApi, Camera, CameraSource, EventPage, EventDetail, Health, Metrics, UploadState, PlaybackAction, SystemAlert, CloudSyncStatus, WaitingPassage } from './gate-api.service';
 import { CameraGridComponent } from './camera-grid.component';
 import { EventTableComponent } from './event-table.component';
 import { EventDetailComponent } from './event-detail.component';
@@ -13,7 +13,7 @@ import { RoiEditorComponent } from './roi-editor.component';
 
 @Component({
   selector: 'gate-app', standalone: true,
-  imports: [FormsModule, DatePipe, CameraGridComponent, EventTableComponent, EventDetailComponent, SystemHealthComponent, RoiEditorComponent],
+  imports: [FormsModule, DatePipe, DecimalPipe, CameraGridComponent, EventTableComponent, EventDetailComponent, SystemHealthComponent, RoiEditorComponent],
   templateUrl: './app.component.html'
 })
 export class AppComponent {
@@ -21,6 +21,9 @@ export class AppComponent {
   private destroy = inject(DestroyRef);
   private refresh = new Subject<void>();
   activeTab = signal<'overview' | 'cameras' | 'calibration' | 'events' | 'detail'>('cameras');
+  folderFilter = signal<'all' | 'waiting' | 'detected_in' | 'detected_out'>('all');
+  waitingPassages = signal<WaitingPassage[]>([]);
+  waitingCount = computed(() => this.waitingPassages().length);
   cameras = signal<Camera[]>([]);
   cameraSources = signal<CameraSource[]>([]);
   discovery = signal({state: 'WAITING', found: 0, message: 'Waiting for camera discovery'});
@@ -64,8 +67,12 @@ export class AppComponent {
         health: this.api.health(),
         metrics: this.api.metrics(),
         alerts: this.api.alerts().pipe(catchError(() => of([]))),
-        events: this.api.events(this.offset, this.containerFilter, this.typeFilter).pipe(catchError(() => of(null))),
-        cloudSync: this.api.cloudSyncStatus()
+        waiting: this.api.waitingPassages().pipe(catchError(() => of({items: [], total: 0}))),
+        events: this.api.events(this.offset, this.containerFilter, this.typeFilter, this.folderFilter()).pipe(catchError(() => of(null))),
+        cloudSync: this.api.cloudSyncStatus(),
+        detail: this.activeTab() === 'detail' && this.detail()?.id
+          ? this.api.event(this.detail()!.id).pipe(catchError(() => of(null)))
+          : of(null)
       }).pipe(timeout(15000), catchError(() => of(null)))),
       takeUntilDestroyed(this.destroy)
     ).subscribe(data => {
@@ -75,6 +82,12 @@ export class AppComponent {
       if (!this.selectedCalibrationCameraId() && data.cameras.length) this.selectedCalibrationCameraId.set(data.cameras[0].id);
       this.discovery.set(data.discovery);
       this.cloudSync.set(data.cloudSync || data.health?.cloud_sync || null);
+      if (data.waiting) {
+        this.waitingPassages.set(data.waiting.items || []);
+      }
+      if (data.detail && this.activeTab() === 'detail') {
+        this.detail.set(data.detail);
+      }
       if (data.alerts && data.alerts.length > 0) {
         this.alerts.set(data.alerts);
         const top = data.alerts[0];
@@ -94,8 +107,18 @@ export class AppComponent {
 
   private syncFromHash() {
     const hash = window.location.hash.replace(/^#/, '');
-    if (hash === 'events') {
+    if (hash === 'events' || hash === 'events-all') {
       this.activeTab.set('events');
+      this.folderFilter.set('all');
+    } else if (hash === 'waiting' || hash === 'events-waiting') {
+      this.activeTab.set('events');
+      this.folderFilter.set('waiting');
+    } else if (hash === 'detected_in' || hash === 'events-in') {
+      this.activeTab.set('events');
+      this.folderFilter.set('detected_in');
+    } else if (hash === 'detected_out' || hash === 'events-out') {
+      this.activeTab.set('events');
+      this.folderFilter.set('detected_out');
     } else if (hash === 'cameras') {
       this.activeTab.set('cameras');
     } else if (hash === 'calibration') {
@@ -110,6 +133,19 @@ export class AppComponent {
     } else if (hash === 'overview') {
       this.activeTab.set('cameras');
     }
+  }
+
+  setFolder(folder: 'all' | 'waiting' | 'detected_in' | 'detected_out') {
+    this.folderFilter.set(folder);
+    this.offset = 0;
+    this.refresh.next();
+  }
+
+  openCalibration(cameraId?: string) {
+    if (cameraId) {
+      this.selectedCalibrationCameraId.set(cameraId);
+    }
+    this.setTab('calibration');
   }
 
   setTab(tab: 'overview' | 'cameras' | 'calibration' | 'events' | 'detail') {

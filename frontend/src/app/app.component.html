@@ -25,6 +25,10 @@
         Test Buzzer 🔔
       </button>
     </div>
+    <div class="header-compute-badge" [title]="(metrics()?.gpu_name || 'Jetson AGX Orin') + ' · ' + (metrics()?.gpu_source || 'tegrastats')">
+      <small>COMPUTE</small>
+      <span>CPU {{ metrics()?.cpu_percent | number:'1.0-0' }}% · GPU {{ metrics()?.gpu_utilization_percent == null ? '—' : (metrics()?.gpu_utilization_percent | number:'1.0-0') + '%' }}</span>
+    </div>
     <div><small>SITE</small><span>Panvel CFS</span></div>
     <div class="admin-context">
       <span class="avatar">A</span>
@@ -61,9 +65,24 @@
 <aside class="left-nav" aria-label="Gate module navigation">
   <div class="left-nav-label">MODULE</div>
   <button [class.active]="activeTab() === 'cameras'" (click)="setTab('cameras')"><span>▣</span>Camera settings</button>
-  <button [class.active]="activeTab() === 'calibration'" (click)="setTab('calibration')"><span>⌗</span>Lane calibration</button>
+  <button [class.active]="activeTab() === 'calibration'" (click)="setTab('calibration')"><span>⚡</span>Virtual Line & ROI</button>
   <div class="left-nav-divider"></div>
-  <button [class.active]="activeTab() === 'events'" (click)="setTab('events')"><span>≡</span>Gate events</button>
+  <div class="left-nav-label">EVENT FOLDERS</div>
+  <button [class.active]="activeTab() === 'events' && folderFilter() === 'waiting'" (click)="setTab('events'); setFolder('waiting')">
+    <span>⏳</span>Waiting
+    @if (waitingCount() > 0) {
+      <span class="left-nav-badge pulse">{{ waitingCount() }}</span>
+    }
+  </button>
+  <button [class.active]="activeTab() === 'events' && folderFilter() === 'detected_in'" (click)="setTab('events'); setFolder('detected_in')">
+    <span>📥</span>Detected IN
+  </button>
+  <button [class.active]="activeTab() === 'events' && folderFilter() === 'detected_out'" (click)="setTab('events'); setFolder('detected_out')">
+    <span>📤</span>Detected OUT
+  </button>
+  <button [class.active]="activeTab() === 'events' && folderFilter() === 'all'" (click)="setTab('events'); setFolder('all')">
+    <span>📁</span>All Events
+  </button>
 </aside>
 
 <main>
@@ -196,14 +215,15 @@
             (laneControl)="lanePlayback($event.gateId, $event.action)"
             (sourceChange)="selectCamera($event)"
             (roleChange)="setCameraRole($event)"
+            (openCalibration)="openCalibration($event)"
           />
           }
 
           @if (activeTab() === 'calibration') {
-          <section class="lane-control-panel" aria-label="Lane state machine and calibration">
+          <section class="lane-control-panel" aria-label="Virtual laser lines, ROI and lane calibration">
             <div class="section-heading">
-              <div><h2>Lane state machine</h2><p>Every camera reports the same operational state used to decide when OCR and new events are allowed.</p></div>
-              <span class="subtle">CALIBRATION + LIVE STATE</span>
+              <div><h2>⚡ Virtual Laser Line & ROI Calibration</h2><p>Configure virtual laser tripwire sensor lines, entry triggers, clearance boundaries, and ROI detection masks.</p></div>
+              <span class="subtle">VIRTUAL SENSOR + CALIBRATION</span>
             </div>
             <div class="lane-state-grid">
               @for (camera of cameras(); track camera.id) {
@@ -254,46 +274,178 @@
       <div class="page-heading">
         <div>
           <div class="eyebrow">EVENT LOG <span>/</span> GATE MODULE</div>
-          <h1>Recent gate events</h1>
-          <p>Complete historical log of container detections, ISO validations, evidence snapshots and event JSON files.</p>
+          <h1>
+            @if (folderFilter() === 'waiting') {
+              ⏳ Waiting / In-Progress Passages
+            } @else if (folderFilter() === 'detected_in') {
+              📥 Detected IN Events
+            } @else if (folderFilter() === 'detected_out') {
+              📤 Detected OUT Events
+            } @else {
+              📁 Recent gate events
+            }
+          </h1>
+          <p>
+            @if (folderFilter() === 'waiting') {
+              Active truck passages dwelling at gate cameras waiting for OCR confirmation or clearance (staged in <code>snapshots/waiting/</code>).
+            } @else if (folderFilter() === 'detected_in') {
+              Finalized Gate-IN container detections, proofs and event manifests (stored in <code>snapshots/detected_in/</code>).
+            } @else if (folderFilter() === 'detected_out') {
+              Finalized Gate-OUT container detections, proofs and event manifests (stored in <code>snapshots/detected_out/</code>).
+            } @else {
+              Complete historical log of container detections, ISO validations, evidence snapshots and event JSON files.
+            }
+          </p>
         </div>
-        <span class="count-pill large-pill">{{ page().total }} total events</span>
+        <span class="count-pill large-pill">
+          @if (folderFilter() === 'waiting') {
+            {{ waitingCount() }} waiting
+          } @else {
+            {{ page().total }} events
+          }
+        </span>
       </div>
 
       <section class="panel events-full-panel" aria-labelledby="events-heading">
+        <!-- FOLDER CHIPS NAVIGATION -->
+        <div class="folder-nav-strip">
+          <button type="button" class="folder-nav-chip" [class.active]="folderFilter() === 'all'" (click)="setFolder('all')">
+            <span class="folder-icon">📁</span>
+            <span>All Events</span>
+            <span class="folder-badge">{{ page().total }}</span>
+          </button>
+          <button type="button" class="folder-nav-chip waiting-chip" [class.active]="folderFilter() === 'waiting'" (click)="setFolder('waiting')">
+            <span class="folder-icon">⏳</span>
+            <span>Waiting</span>
+            @if (waitingCount() > 0) {
+              <span class="folder-badge pulse-badge">{{ waitingCount() }}</span>
+            } @else {
+              <span class="folder-badge empty-badge">0</span>
+            }
+          </button>
+          <button type="button" class="folder-nav-chip in-chip" [class.active]="folderFilter() === 'detected_in'" (click)="setFolder('detected_in')">
+            <span class="folder-icon">📥</span>
+            <span>Detected IN</span>
+          </button>
+          <button type="button" class="folder-nav-chip out-chip" [class.active]="folderFilter() === 'detected_out'" (click)="setFolder('detected_out')">
+            <span class="folder-icon">📤</span>
+            <span>Detected OUT</span>
+          </button>
+        </div>
+
         @if (eventsError()) {
           <div class="alert warn" role="status">{{ eventsError() }}</div>
         }
 
-        <form class="filters" (ngSubmit)="filter()">
-          <label>
-            Container number
-            <input name="container" [(ngModel)]="containerFilter" maxlength="11" placeholder="Search container (e.g. GXYU5090704)">
-          </label>
-          <label>
-            Movement
-            <select name="movement" [(ngModel)]="typeFilter">
-              <option value="">All movements</option>
-              <option>ENTRY</option>
-              <option>EXIT</option>
-              <option>UNKNOWN</option>
-            </select>
-          </label>
-          <button type="submit" class="primary">Apply filters</button>
-          @if (containerFilter || typeFilter) {
-            <button type="button" (click)="containerFilter = ''; typeFilter = ''; filter()">Clear</button>
-          }
-        </form>
+        <!-- WAITING / IN-PROGRESS VIEW -->
+        @if (folderFilter() === 'waiting') {
+          <div class="waiting-passages-container">
+            <div class="waiting-header-banner">
+              <div>
+                <strong>Active Dwelling & OCR Passages</strong>
+                <p>Vehicles currently detected at the gate waiting for container verification or clearance. Staged in <code>snapshots/waiting/</code>.</p>
+              </div>
+              <span class="waiting-live-indicator">● LIVE ACTIVE</span>
+            </div>
 
-        <gate-event-table [events]="page().items" (selected)="select($event)" />
+            @if (waitingPassages().length === 0) {
+              <div class="empty-waiting-card">
+                <span class="empty-icon">⏳</span>
+                <strong>No vehicles currently waiting</strong>
+                <p>When a truck dwells at the gate, its camera captures and live OCR candidates appear here before final promotion to <strong>Detected IN</strong> or <strong>Detected OUT</strong>.</p>
+              </div>
+            } @else {
+              <div class="waiting-cards-grid">
+                @for (passage of waitingPassages(); track passage.id) {
+                  <article class="waiting-passage-card">
+                    <div class="waiting-card-top">
+                      <div class="waiting-lane-badge">
+                        <span class="lane-name">{{ passage.gate_id }}</span>
+                        <span class="direction-tag" [class.dir-in]="passage.direction === 'ENTRY'" [class.dir-out]="passage.direction === 'EXIT'">
+                          {{ passage.direction === 'ENTRY' ? '📥 ENTRY' : '📤 EXIT' }}
+                        </span>
+                      </div>
+                      <div class="waiting-dwell-pill">
+                        ⏱ Dwelling {{ passage.dwell_seconds }}s
+                      </div>
+                    </div>
 
-        <div class="pagination">
-          <small>Showing {{ page().items.length ? page().offset + 1 : 0 }}–{{ page().offset + page().items.length }} of {{ page().total }}</small>
-          <div>
-            <button [disabled]="page().offset === 0" (click)="movePage(-25)">Previous</button>
-            <button [disabled]="page().offset + 25 >= page().total" (click)="movePage(25)">Next</button>
+                    <div class="waiting-card-body">
+                      <div class="waiting-detail-row">
+                        <small>Passage ID</small>
+                        <span class="mono">{{ passage.id.slice(0, 8) }}…</span>
+                      </div>
+                      <div class="waiting-detail-row">
+                        <small>Camera</small>
+                        <span>{{ passage.camera_id }}</span>
+                      </div>
+                      <div class="waiting-detail-row">
+                        <small>Folder</small>
+                        <code class="folder-path-pill">{{ passage.folder_path }}</code>
+                      </div>
+                      <div class="waiting-detail-row">
+                        <small>Status</small>
+                        <span class="badge" [class.good]="passage.status === 'WAITING_CLEARANCE'" [class.warn]="passage.status === 'WAITING_OCR'">
+                          {{ passage.status === 'WAITING_CLEARANCE' ? 'WAITING CLEARANCE' : 'OCR IN PROGRESS' }}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div class="waiting-candidates-section">
+                      <small class="candidates-title">CANDIDATE CONTAINER READS</small>
+                      @if (passage.candidates.length === 0) {
+                        <div class="no-reads-subtle">Reading container numbers from camera frames…</div>
+                      } @else {
+                        <div class="candidates-list">
+                          @for (cand of passage.candidates; track cand.container_number) {
+                            <div class="candidate-pill-row">
+                              <span class="cand-number mono">{{ cand.container_number }}</span>
+                              <span class="cand-votes">{{ cand.votes }} votes</span>
+                              <span class="cand-conf">{{ (cand.confidence * 100) | number:'1.0-0' }}%</span>
+                            </div>
+                          }
+                        </div>
+                      }
+                    </div>
+                  </article>
+                }
+              </div>
+            }
           </div>
-        </div>
+        } @else {
+          <!-- DETECTED IN / DETECTED OUT / ALL EVENTS VIEW -->
+          <form class="filters" (ngSubmit)="filter()">
+            <label>
+              Container number
+              <input name="container" [(ngModel)]="containerFilter" maxlength="11" placeholder="Search container (e.g. GXYU5090704)">
+            </label>
+            @if (folderFilter() === 'all') {
+              <label>
+                Movement
+                <select name="movement" [(ngModel)]="typeFilter">
+                  <option value="">All movements</option>
+                  <option>ENTRY</option>
+                  <option>EXIT</option>
+                  <option>UNKNOWN</option>
+                </select>
+              </label>
+            }
+            <button type="submit" class="primary">Apply filters</button>
+            @if (containerFilter || (folderFilter() === 'all' && typeFilter)) {
+              <button type="button" (click)="containerFilter = ''; typeFilter = ''; filter()">Clear</button>
+            }
+          </form>
+
+          <gate-event-table [events]="page().items" (selected)="select($event)" />
+
+          <div class="pagination">
+            <small>Showing {{ page().items.length ? page().offset + 1 : 0 }}–{{ page().offset + page().items.length }} of {{ page().total }}</small>
+            <div>
+              <button [disabled]="page().offset === 0" (click)="movePage(-25)">Previous</button>
+              <button [disabled]="page().offset + 25 >= page().total" (click)="movePage(25)">Next</button>
+            </div>
+          </div>
+        }
       </section>
     </div>
   }

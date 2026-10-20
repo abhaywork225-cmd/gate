@@ -45,7 +45,12 @@ import { GateEvent } from './gate-api.service';
       }
     </td>
     <td>{{ event.gate_id }}</td>
-    <td><span class="badge movement-badge">{{ event.event_type }}</span></td>
+    <td>
+      <span class="badge movement-badge">{{ event.event_type }}</span>
+      <div class="table-folder-subtext" [class.folder-in]="event.folder === 'detected_in'" [class.folder-out]="event.folder === 'detected_out'">
+        {{ event.folder === 'detected_out' ? '📤 detected_out' : '📥 detected_in' }}
+      </div>
+    </td>
     <td><span class="badge" [class.good]="event.status === 'CONFIRMED'" [class.warn]="event.status === 'NEEDS_REVIEW'">{{ event.status.replaceAll('_', ' ') }}</span></td>
     <td>
       @if (event.cloud_synced) {

@@ -35,7 +35,7 @@ def review_feedback(event, readings):
                   for o in readings]
     complete = [v for v in candidates if v.valid_format]
     best = max(complete, key=lambda v: (v.valid_check_digit, v.confidence), default=None)
-    supported = {v.normalized_text for v in candidates if v.valid_check_digit}
+    supported = {v.normalized_text for v in candidates if v.valid_check_digit or (v.valid_format and float(v.confidence or 0) >= 0.50)}
     unsupported = []
     for field in ('container_number', 'container_number_2'):
         number = event.get(field)
@@ -179,65 +179,135 @@ class GateRepository:
                 if session.get(GateEvent,passage.id):
                     return passage.id
                 best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
-                if numbers:
-                    recent = session.execute(
+                matched_existing = None
+                passage_visit = passage.visit_id or passage.id
+                if passage_visit:
+                    matched_existing = session.execute(
                         select(GateEvent).where(
-                            GateEvent.container_number == numbers[0],
-                            GateEvent.lane_id == passage.lane_id
+                            GateEvent.id != passage.id,
+                            (GateEvent.visit_id == passage_visit) | (GateEvent.id == passage_visit)
+                        ).order_by(GateEvent.timestamp.desc())
+                    ).scalars().first()
+
+                if not matched_existing and numbers:
+                    cand_num = numbers[0].strip().upper()
+                    delta = timedelta(seconds=180.0)
+                    recent_events = session.execute(
+                        select(GateEvent).where(
+                            GateEvent.lane_id == passage.lane_id,
+                            GateEvent.id != passage.id,
+                            GateEvent.timestamp >= passage.started - delta,
+                            GateEvent.timestamp <= passage.started + delta
                         ).order_by(GateEvent.timestamp.desc())
                     ).scalars().all()
-                    for existing in recent:
-                        if abs((passage.started - existing.timestamp).total_seconds()) <= 900.0:
-                            existing_snaps = {s.camera_id for s in session.execute(
-                                select(Snapshot).where(Snapshot.event_id == existing.id)
-                            ).scalars().all()}
-                            bundles = [(n,entries[n]['proofs']) for n in numbers]
-                            for index,(number,proofs) in enumerate(bundles):
-                                for camera_id,(validation,job) in proofs.items():
-                                    if camera_id not in existing_snaps:
-                                        detection_id,snapshot_id = str(uuid4()),str(uuid4())
-                                        proof_folder = existing.visit_id or existing.id
-                                        path = snapshots.save_side_snapshot(proof_folder,
-                                            f'{camera_id}_{snapshot_id}_proof',job.frame.image)
-                                        created.append(path)
-                                        session.add(DetectionRecord(id=detection_id,event_id=existing.id,camera_id=camera_id,
-                                            origin_key=f'final:{existing.id}:{snapshot_id}',track_id=job.track_id,
-                                            class_name=job.detection.class_name,confidence=job.detection.confidence,
-                                            bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
-                                        session.flush()
-                                        session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
-                                            raw_text=validation.raw_text,normalized_text=number or '',
-                                            confidence=validation.confidence if number else 0,
-                                            valid_format=bool(number),valid_check_digit=bool(number),
-                                            validation_status=validation.validation_status if number else 'UNREADABLE'))
-                                        session.add(Snapshot(id=snapshot_id,event_id=existing.id,camera_id=camera_id,
-                                            image_path=path,timestamp=job.frame.timestamp))
-                                        existing_snaps.add(camera_id)
-                            # Attach companion camera context images if that camera is not yet in snapshots
-                            proof_folder = existing.visit_id or existing.id
-                            visit_dir = snapshots.path(proof_folder)
-                            if visit_dir.is_dir():
-                                valid_cameras = {c.id for c in session.execute(select(Camera)).scalars().all()}
-                                for ctx_file in sorted(visit_dir.glob('*_context_*.jpg')):
-                                    matched_cam = next((c for c in valid_cameras if c in ctx_file.name), None)
-                                    if not matched_cam or matched_cam in existing_snaps:
-                                        continue
-                                    snap_id = str(uuid4())
-                                    det_id = str(uuid4())
-                                    rel_path = f'{proof_folder}/{ctx_file.name}'
-                                    session.add(DetectionRecord(
-                                        id=det_id, event_id=existing.id, camera_id=matched_cam,
-                                        origin_key=f'final:{existing.id}:{snap_id}', track_id=-1,
-                                        class_name='context_roi', confidence=1.0,
-                                        bbox=[0.0, 0.0, 2560.0, 1440.0], timestamp=existing.timestamp
-                                    ))
-                                    session.add(Snapshot(
-                                        id=snap_id, event_id=existing.id, camera_id=matched_cam,
-                                        image_path=rel_path, timestamp=existing.timestamp
-                                    ))
-                                    existing_snaps.add(matched_cam)
-                            snapshots.save_event_json(existing.id,self.event(existing.id))
-                            return existing.id
+                    for ev in recent_events:
+                        c_num = (ev.container_number or '').strip().upper()
+                        if c_num == cand_num or (ev.container_number_2 or '').strip().upper() == cand_num:
+                            matched_existing = ev
+                            break
+                        if len(cand_num) == 11 and len(c_num) == 11 and cand_num[4:10] == c_num[4:10]:
+                            matched_existing = ev
+                            break
+                        if len(cand_num) == 11 and len(c_num) == 11 and cand_num[:4] == c_num[:4]:
+                            if sum(a == b for a, b in zip(cand_num[4:10], c_num[4:10])) >= 5:
+                                matched_existing = ev
+                                break
+
+                if matched_existing:
+                    existing = matched_existing
+                    def _quality(val_num, val_obj=None):
+                        if not val_num: return 0.0
+                        v_num = val_num.strip().upper()
+                        if len(v_num) != 11: return 1.0
+                        q = 10.0
+                        from app.ocr.validator import check_digit, STRUCTURE
+                        if STRUCTURE.fullmatch(v_num):
+                            q += 50.0
+                            try:
+                                if check_digit(v_num[:10]) == int(v_num[10]):
+                                    q += 500.0
+                            except Exception:
+                                pass
+                        if v_num.startswith(('MSKU','MEDU','MAEU','CMAU','TCNU','TGHU','TRHU','WHSU','SPSU','KKTU','TEMU','TIIU')):
+                            q += 100.0
+                        if val_obj:
+                            q += float(getattr(val_obj, 'confidence', 0.0)) * 50.0
+                        return q
+
+                    if numbers and _quality(numbers[0], best[0]) > _quality(existing.container_number):
+                        existing.container_number = numbers[0]
+                        if best[0].size_type:
+                            existing.iso_code_1 = best[0].size_type
+                        existing.status = status
+                        existing.cloud_synced = False
+                    existing_snaps = {s.camera_id for s in session.execute(
+                        select(Snapshot).where(Snapshot.event_id == existing.id)
+                    ).scalars().all()}
+                    bundles = [(n,entries[n]['proofs']) for n in numbers]
+                    for index,(number,proofs) in enumerate(bundles):
+                        for camera_id,(validation,job) in proofs.items():
+                            if camera_id not in existing_snaps:
+                                detection_id,snapshot_id = str(uuid4()),str(uuid4())
+                                base_folder = existing.visit_id or existing.id
+                                snapshots.promote_from_waiting(base_folder, existing.event_type)
+                                proof_folder = f'{snapshots.category_for(existing.event_type)}/{base_folder}'
+                                path = snapshots.save_side_snapshot(proof_folder,
+                                    f'{camera_id}_{snapshot_id}_proof',job.frame.image, direction=existing.event_type)
+                                created.append(path)
+                                session.add(DetectionRecord(id=detection_id,event_id=existing.id,camera_id=camera_id,
+                                    origin_key=f'final:{existing.id}:{snapshot_id}',track_id=job.track_id,
+                                    class_name=job.detection.class_name,confidence=job.detection.confidence,
+                                    bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
+                                session.flush()
+                                session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
+                                    raw_text=validation.raw_text,normalized_text=number or '',
+                                    confidence=validation.confidence if number else 0,
+                                    valid_format=bool(number),valid_check_digit=bool(number),
+                                    validation_status=validation.validation_status if number else 'UNREADABLE'))
+                                if not session.scalar(select(Snapshot).where(Snapshot.image_path == path)):
+                                    session.add(Snapshot(id=snapshot_id,event_id=existing.id,camera_id=camera_id,
+                                        image_path=path,timestamp=job.frame.timestamp))
+                                existing_snaps.add(camera_id)
+                                existing.cloud_synced = False
+                    # Attach companion camera context images if that camera is not yet in snapshots
+                    base_folder = existing.visit_id or existing.id
+                    proof_folder = f'{snapshots.category_for(existing.event_type)}/{base_folder}'
+                    visit_dir = snapshots.path(proof_folder)
+                    if visit_dir.is_dir():
+                        valid_cameras = {c.id for c in session.execute(select(Camera)).scalars().all()}
+                        for matched_cam in sorted(valid_cameras):
+                            if matched_cam in existing_snaps:
+                                continue
+                            cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*_frame.png'))
+                            if cam_frames:
+                                chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
+                            else:
+                                ctx_files = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg'))
+                                if ctx_files:
+                                    chosen_file = max(ctx_files, key=lambda f: f.stat().st_size)
+                                else:
+                                    continue
+                            rel_path = f'{proof_folder}/{chosen_file.name}'
+                            existing_snap = session.scalar(select(Snapshot).where(Snapshot.image_path == rel_path))
+                            if existing_snap:
+                                existing_snaps.add(matched_cam)
+                                continue
+                            snap_id = str(uuid4())
+                            det_id = str(uuid4())
+                            session.add(DetectionRecord(
+                                id=det_id, event_id=existing.id, camera_id=matched_cam,
+                                origin_key=f'final:{existing.id}:{snap_id}', track_id=-1,
+                                class_name='context_roi', confidence=1.0,
+                                bbox=[0.0, 0.0, 2560.0, 1440.0], timestamp=existing.timestamp
+                            ))
+                            session.add(Snapshot(
+                                id=snap_id, event_id=existing.id, camera_id=matched_cam,
+                                image_path=rel_path, timestamp=existing.timestamp
+                            ))
+                            existing_snaps.add(matched_cam)
+                            existing.cloud_synced = False
+                    snapshots.save_event_json(existing.id,self.event(existing.id))
+                    return existing.id
                     # Upgrade recent UNREADABLE event on the same lane to this identified container
                     recent_unreadable = session.execute(
                         select(GateEvent).where(
@@ -260,25 +330,26 @@ class GateRepository:
                             bundles = [(n,entries[n]['proofs']) for n in numbers]
                             for index,(number,proofs) in enumerate(bundles):
                                 for camera_id,(validation,job) in proofs.items():
-                                    if camera_id not in existing_snaps:
-                                        detection_id,snapshot_id = str(uuid4()),str(uuid4())
-                                        proof_folder = unreadable_ev.visit_id or unreadable_ev.id
-                                        path = snapshots.save_side_snapshot(proof_folder,
-                                            f'{camera_id}_{snapshot_id}_proof',job.frame.image)
-                                        created.append(path)
-                                        session.add(DetectionRecord(id=detection_id,event_id=unreadable_ev.id,camera_id=camera_id,
-                                            origin_key=f'final:{unreadable_ev.id}:{snapshot_id}',track_id=job.track_id,
-                                            class_name=job.detection.class_name,confidence=job.detection.confidence,
-                                            bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
-                                        session.flush()
-                                        session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
-                                            raw_text=validation.raw_text,normalized_text=number or '',
-                                            confidence=validation.confidence if number else 0,
-                                            valid_format=bool(number),valid_check_digit=bool(number),
-                                            validation_status=validation.validation_status if number else 'UNREADABLE'))
+                                    detection_id,snapshot_id = str(uuid4()),str(uuid4())
+                                    proof_folder = unreadable_ev.visit_id or unreadable_ev.id
+                                    path = snapshots.save_side_snapshot(proof_folder,
+                                        f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                                    created.append(path)
+                                    session.add(DetectionRecord(id=detection_id,event_id=unreadable_ev.id,camera_id=camera_id,
+                                        origin_key=f'final:{unreadable_ev.id}:{snapshot_id}',track_id=job.track_id,
+                                        class_name=job.detection.class_name,confidence=job.detection.confidence,
+                                        bbox=list(job.detection.bbox),timestamp=job.frame.timestamp))
+                                    session.flush()
+                                    session.add(OCRResult(id=str(uuid4()),detection_id=detection_id,
+                                        raw_text=validation.raw_text,normalized_text=number or '',
+                                        confidence=validation.confidence if number else 0,
+                                        valid_format=bool(number),valid_check_digit=bool(number),
+                                        validation_status=validation.validation_status if number else 'UNREADABLE'))
+                                    if not session.scalar(select(Snapshot).where(Snapshot.image_path == path)):
                                         session.add(Snapshot(id=snapshot_id,event_id=unreadable_ev.id,camera_id=camera_id,
                                             image_path=path,timestamp=job.frame.timestamp))
-                                        existing_snaps.add(camera_id)
+                                    existing_snaps.add(camera_id)
+                            unreadable_ev.cloud_synced = False
                             snapshots.save_event_json(unreadable_ev.id,self.event(unreadable_ev.id))
                             return unreadable_ev.id
                 else:
@@ -309,8 +380,9 @@ class GateRepository:
                                         raw_text=validation.raw_text,normalized_text='',
                                         confidence=0,valid_format=False,valid_check_digit=False,
                                         validation_status='UNREADABLE'))
-                                    session.add(Snapshot(id=snapshot_id,event_id=existing.id,camera_id=camera_id,
-                                        image_path=path,timestamp=job.frame.timestamp))
+                                    if not session.scalar(select(Snapshot).where(Snapshot.image_path == path)):
+                                        session.add(Snapshot(id=snapshot_id,event_id=existing.id,camera_id=camera_id,
+                                            image_path=path,timestamp=job.frame.timestamp))
                                     existing_snaps.add(camera_id)
                             snapshots.save_event_json(existing.id,self.event(existing.id))
                             return existing.id
@@ -323,12 +395,14 @@ class GateRepository:
                 session.flush()
                 bundles = [(n,entries[n]['proofs']) for n in numbers] or [(None,unreadable)]
                 saved_snaps = set()
+                base_folder = visit_id or passage.id
+                snapshots.promote_from_waiting(base_folder, passage.direction)
+                proof_folder = f'{snapshots.category_for(passage.direction)}/{base_folder}'
                 for index,(number,proofs) in enumerate(bundles):
                     for camera_id,(validation,job) in proofs.items():
                         detection_id,snapshot_id = str(uuid4()),str(uuid4())
-                        proof_folder = visit_id or passage.id
                         path = snapshots.save_side_snapshot(proof_folder,
-                            f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                            f'{camera_id}_{snapshot_id}_proof',job.frame.image, direction=passage.direction)
                         created.append(path)
                         session.add(DetectionRecord(id=detection_id,event_id=passage.id,camera_id=camera_id,
                             origin_key=f'final:{passage.id}:{snapshot_id}',track_id=job.track_id,
@@ -340,21 +414,33 @@ class GateRepository:
                             confidence=validation.confidence if number else 0,
                             valid_format=bool(number),valid_check_digit=bool(number),
                             validation_status=validation.validation_status if number else 'UNREADABLE'))
-                        session.add(Snapshot(id=snapshot_id,event_id=passage.id,camera_id=camera_id,
-                            image_path=path,timestamp=job.frame.timestamp))
+                        if not session.scalar(select(Snapshot).where(Snapshot.image_path == path)):
+                            session.add(Snapshot(id=snapshot_id,event_id=passage.id,camera_id=camera_id,
+                                image_path=path,timestamp=job.frame.timestamp))
                         saved_snaps.add(camera_id)
                 # Attach companion camera context images if that camera is not yet in snapshots
-                proof_folder = visit_id or passage.id
                 visit_dir = snapshots.path(proof_folder)
                 if visit_dir.is_dir():
                     valid_cameras = {c.id for c in session.execute(select(Camera)).scalars().all()}
-                    for ctx_file in sorted(visit_dir.glob('*_context_*.jpg')):
-                        matched_cam = next((c for c in valid_cameras if c in ctx_file.name), None)
-                        if not matched_cam or matched_cam in saved_snaps:
+                    for matched_cam in sorted(valid_cameras):
+                        if matched_cam in saved_snaps:
+                            continue
+                        cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*_frame.png'))
+                        if cam_frames:
+                            chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
+                        else:
+                            ctx_files = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg'))
+                            if ctx_files:
+                                chosen_file = max(ctx_files, key=lambda f: f.stat().st_size)
+                            else:
+                                continue
+                        rel_path = f'{proof_folder}/{chosen_file.name}'
+                        existing_snap = session.scalar(select(Snapshot).where(Snapshot.image_path == rel_path))
+                        if existing_snap:
+                            saved_snaps.add(matched_cam)
                             continue
                         snap_id = str(uuid4())
                         det_id = str(uuid4())
-                        rel_path = f'{proof_folder}/{ctx_file.name}'
                         session.add(DetectionRecord(
                             id=det_id, event_id=passage.id, camera_id=matched_cam,
                             origin_key=f'final:{passage.id}:{snap_id}', track_id=-1,
@@ -434,15 +520,16 @@ class GateRepository:
                     cx,cy = (x1+x2)/2,(y1+y2)/2
                     cw,ch = min(w,max(320,int((x2-x1)*6))),min(h,max(240,int((y2-y1)*12)))
                     left,top = max(0,min(w-cw,int(cx-cw/2))),max(0,min(h-ch,int(cy-ch/2)))
-                    proof_image = image[top:top+ch,left:left+cw].copy()
                     obs = Observation(origin, passage.gate_id, job.track_id,
-                                      job.detection, validation, passage.direction, proof_image,
+                                      job.detection, validation, passage.direction, image,
                                       passage.started, True, slot_position=slot, is_twin=twin)
-                    path = snapshots.save(snapshot_id, obs, passage.id)
+                    snapshots.promote_from_waiting(passage.id, passage.direction)
+                    proof_folder = f'{snapshots.category_for(passage.direction)}/{passage.id}'
+                    path = snapshots.save(snapshot_id, obs, proof_folder, direction=passage.direction)
                     created_paths.append(path)
                     context_id = str(uuid4())
-                    context_path = snapshots.save_side_snapshot(passage.id,
-                        f'{job.detection.camera_id}_{snapshot_id}_context', job.frame.image)
+                    context_path = snapshots.save_side_snapshot(proof_folder,
+                        f'{job.detection.camera_id}_{snapshot_id}_context', job.frame.image, direction=passage.direction)
                     created_paths.append(context_path)
                     session.add(DetectionRecord(id=detection_id, event_id=passage.id,
                         camera_id=job.detection.camera_id, origin_key=obs.origin_key,
@@ -454,10 +541,12 @@ class GateRepository:
                         raw_text=validation.raw_text, normalized_text=number, confidence=validation.confidence,
                         valid_format=validation.valid_format, valid_check_digit=validation.valid_check_digit,
                         validation_status=validation.validation_status))
-                    session.add(Snapshot(id=snapshot_id,event_id=passage.id,camera_id=job.detection.camera_id,
-                        image_path=path,timestamp=job.detection.frame_timestamp))
-                    session.add(Snapshot(id=context_id,event_id=passage.id,camera_id=job.detection.camera_id,
-                        image_path=context_path,timestamp=job.detection.frame_timestamp))
+                    if not session.scalar(select(Snapshot).where(Snapshot.image_path == path)):
+                        session.add(Snapshot(id=snapshot_id,event_id=passage.id,camera_id=job.detection.camera_id,
+                            image_path=path,timestamp=job.detection.frame_timestamp))
+                    if not session.scalar(select(Snapshot).where(Snapshot.image_path == context_path)):
+                        session.add(Snapshot(id=context_id,event_id=passage.id,camera_id=job.detection.camera_id,
+                            image_path=context_path,timestamp=job.detection.frame_timestamp))
                 session.add(SystemLog(id=str(uuid4()),event_id=passage.id,level='INFO',
                     event_name='truck_passage_finalized',context={'lane_id':passage.lane_id,
                     'identities':list(candidates),'needs_review':uncertain or not entries}))
@@ -628,8 +717,14 @@ class GateRepository:
 
                             # 1. Sequential twin 20ft container passage on the same lane:
                             # A truck chassis can carry two distinct 20-foot containers (front and rear).
-                            # Only fuse if twin chassis or rear slot is genuinely detected/indicated.
-                            twin_indicated = getattr(obs, 'is_twin', False) or cand.is_twin or is_rear_slot
+                            obs_iso = str(getattr(obs.ocr, 'size_type', None) or '')
+                            cand_iso = str(cand.iso_code_1 or '')
+                            obs_is_40 = obs_iso.startswith('4') or obs_iso.startswith('L') or '40' in obs_iso or '45' in obs_iso
+                            cand_is_40 = cand_iso.startswith('4') or cand_iso.startswith('L') or '40' in cand_iso or '45' in cand_iso
+                            twin_indicated = (
+                                getattr(obs, 'is_twin', False) or cand.is_twin or is_rear_slot or
+                                (not obs_is_40 and not cand_is_40 and (obs_iso.startswith('2') and cand_iso.startswith('2')))
+                            )
                             if (
                                 obs.confirmed and twin_indicated and
                                 number and c_num and number != c_num and
@@ -637,10 +732,6 @@ class GateRepository:
                                 time_diff <= 30.0 and
                                 (not cand.container_number_2 or cand.container_number_2 == number)
                             ):
-                                obs_iso = str(getattr(obs.ocr, 'size_type', None) or '')
-                                cand_iso = str(cand.iso_code_1 or '')
-                                obs_is_40 = obs_iso.startswith('4') or obs_iso.startswith('L') or '40' in obs_iso or '45' in obs_iso
-                                cand_is_40 = cand_iso.startswith('4') or cand_iso.startswith('L') or '40' in cand_iso or '45' in cand_iso
                                 if not obs_is_40 and not cand_is_40:
                                     is_rear_slot = True
                                     cand.is_twin = True
@@ -917,13 +1008,13 @@ class GateRepository:
                         object.__setattr__(obs, 'slot_position', 'REAR')
                     except Exception:
                         pass
-                image_path = snapshots.save(snapshot_id, obs, event_id)
+                image_path = snapshots.save(snapshot_id, obs, event_id, direction=obs.direction or (existing.event_type if existing else None))
                 existing_path_snap = session.scalar(select(Snapshot).where(
-                    Snapshot.event_id == event_id,
                     Snapshot.image_path == image_path
                 ))
                 if existing_path_snap:
                     existing_path_snap.timestamp = obs.detection.frame_timestamp
+                    existing_path_snap.event_id = event_id
                 else:
                     created_paths.append(image_path)
                     session.add(Snapshot(id=snapshot_id, event_id=event_id, camera_id=obs.detection.camera_id,
@@ -959,14 +1050,18 @@ class GateRepository:
                                 direction=obs.direction,
                                 text=obs.ocr.normalized_text if obs.confirmed else ''
                             )
-                            if not already_saved:
+                            existing_other_snap = session.scalar(select(Snapshot).where(
+                                Snapshot.image_path == other_path
+                            ))
+                            if not existing_other_snap:
                                 created_paths.append(other_path)
                                 session.add(Snapshot(
                                     id=other_snap_id, event_id=event_id, camera_id=other_cam_id,
                                     image_path=other_path, timestamp=obs.detection.frame_timestamp
                                 ))
                             else:
-                                already_saved.timestamp = obs.detection.frame_timestamp
+                                existing_other_snap.timestamp = obs.detection.frame_timestamp
+                                existing_other_snap.event_id = event_id
 
                 session.add(SystemLog(id=str(uuid4()), event_id=event_id, level='INFO',
                                       event_name='gate_event_created' if created else 'gate_evidence_associated',
@@ -989,11 +1084,17 @@ class GateRepository:
                     pass
             raise
 
-    def events(self, limit=50, offset=0, container=None, camera_id=None, event_type=None, status=None, start_date=None, end_date=None):
+    def events(self, limit=50, offset=0, container=None, camera_id=None, event_type=None, status=None, start_date=None, end_date=None, folder=None):
         with self.db.sessions() as session:
             query = select(GateEvent)
             # Only hide events that have NO containers detected at all
             query = query.where(GateEvent.status != 'DUPLICATE')
+            if folder:
+                f_norm = str(folder).lower().strip()
+                if f_norm == 'detected_in':
+                    query = query.where(GateEvent.event_type.in_(['ENTRY', 'IN', 'GATE_IN']))
+                elif f_norm == 'detected_out':
+                    query = query.where(GateEvent.event_type.in_(['EXIT', 'OUT', 'GATE_OUT']))
             if container:
                 query = query.where((GateEvent.container_number == container.upper()) | (GateEvent.container_number_2 == container.upper()))
             if camera_id:
@@ -1012,6 +1113,9 @@ class GateRepository:
             from app.ocr.validator import parse_feet_size
             import re
             for item in items:
+                folder_name = 'detected_out' if str(item.get('event_type') or '').upper() in ('EXIT', 'OUT', 'GATE_OUT') else 'detected_in'
+                item['folder'] = folder_name
+                item['folder_path'] = f'snapshots/{folder_name}/{item.get("visit_id") or item.get("id")}'
                 has_feet = session.scalar(select(DetectionRecord.id).where(
                     DetectionRecord.event_id == item['id'],
                     func.lower(DetectionRecord.class_name) == 'feet'
@@ -1053,6 +1157,9 @@ class GateRepository:
             if row is None:
                 return None
             result = serialize(row)
+            folder_name = 'detected_out' if str(result.get('event_type') or '').upper() in ('EXIT', 'OUT', 'GATE_OUT') else 'detected_in'
+            result['folder'] = folder_name
+            result['folder_path'] = f'snapshots/{folder_name}/{result.get("visit_id") or result.get("id")}'
             detections = list(session.scalars(select(DetectionRecord).where(DetectionRecord.event_id == event_id)))
             result['detections'] = [serialize(d) for d in detections]
             result['ocr_results'] = [serialize(o) for o in session.scalars(select(OCRResult).where(
@@ -1279,14 +1386,23 @@ class GateRepository:
                 if event.status != 'CONFIRMED':
                     event.status = 'CAPTURED'
 
-    def get_unsynced_confirmed_events(self, limit: int = 50):
+    def get_unsynced_confirmed_events(self, limit: int = 50, include_unreadable: bool = False):
         with self.db.sessions() as session:
+            conds = [
+                (GateEvent.cloud_synced == False) | (GateEvent.cloud_synced.is_(None))
+            ]
+            if include_unreadable:
+                conds.append((GateEvent.status == 'CONFIRMED') | GateEvent.capture_policy.in_(['BEST_AVAILABLE','FINAL_CAPTURE','UNREADABLE_CAPTURE']))
+            else:
+                conds.extend([
+                    GateEvent.status != 'UNREADABLE',
+                    GateEvent.container_number.isnot(None),
+                    GateEvent.container_number != '',
+                    (GateEvent.status == 'CONFIRMED') | GateEvent.capture_policy.in_(['BEST_AVAILABLE','FINAL_CAPTURE'])
+                ])
             query = (
                 select(GateEvent)
-                .where(
-                    (GateEvent.status == 'CONFIRMED') | GateEvent.capture_policy.in_(['BEST_AVAILABLE','FINAL_CAPTURE','UNREADABLE_CAPTURE']),
-                    (GateEvent.cloud_synced == False) | (GateEvent.cloud_synced.is_(None))
-                )
+                .where(*conds)
                 .order_by(GateEvent.timestamp.asc())
                 .limit(limit)
             )
@@ -1449,6 +1565,28 @@ class GateRepository:
                     elif (gap <= 1.5 and not ev1.is_twin and not ev2.is_twin and
                           not distinct_valid_ids):
                         is_match = True
+                    elif (gap <= 4.0 and not ev1.is_twin and not ev2.is_twin and
+                          distinct_valid_ids and c1 != c2):
+                        # Sequential twin containers on the same truck passage
+                        ev1_iso = str(ev1.iso_code_1 or '')
+                        ev2_iso = str(ev2.iso_code_1 or '')
+                        ev1_is_40 = ev1_iso.startswith(('4', 'L')) or '40' in ev1_iso or '45' in ev1_iso
+                        ev2_is_40 = ev2_iso.startswith(('4', 'L')) or '40' in ev2_iso or '45' in ev2_iso
+                        if not ev1_is_40 and not ev2_is_40:
+                            ev1.is_twin = True
+                            ev1.container_number_2 = c2
+                            ev1.iso_code_2 = ev2.iso_code_1 or '22G1'
+                            if not ev1.iso_code_1 or not str(ev1.iso_code_1).startswith('2'):
+                                ev1.iso_code_1 = '22G1'
+                            session.execute(update(DetectionRecord).where(DetectionRecord.event_id == ev2.id).values(event_id=ev1.id))
+                            session.execute(update(Snapshot).where(Snapshot.event_id == ev2.id).values(event_id=ev1.id))
+                            session.execute(update(SystemLog).where(SystemLog.event_id == ev2.id).values(event_id=ev1.id))
+                            if any(e.status == 'CONFIRMED' for e in [ev1, ev2]):
+                                ev1.status = 'CONFIRMED'
+                            session.delete(ev2)
+                            merged_set.add(ev2.id)
+                            merged_count += 1
+                            continue
 
                     if is_match:
                         # ev2 is duplicate of ev1
@@ -1473,8 +1611,29 @@ class GateRepository:
             if not event:
                 return event_id
             if event.capture_policy in ('FINAL_CAPTURE','UNREADABLE_CAPTURE'):
-                # Visit IDs, not a global container-number time window, own
-                # delivery idempotency for tracked container captures.
+                # Suppress duplicate cloud dispatch for same visit or matching container serial digits on same lane
+                delta = timedelta(seconds=180.0)
+                candidates = session.scalars(select(GateEvent).where(
+                    GateEvent.id != event.id,
+                    GateEvent.lane_id == event.lane_id,
+                    GateEvent.status.in_(['CONFIRMED', 'NEEDS_REVIEW']),
+                    GateEvent.timestamp >= event.timestamp - delta,
+                    GateEvent.timestamp <= event.timestamp + delta,
+                ).order_by(GateEvent.timestamp.asc())).all()
+                num = (event.container_number or '').strip().upper()
+                for cand in candidates:
+                    if cand.timestamp > event.timestamp:
+                        continue
+                    if cand.visit_id and event.visit_id and cand.visit_id == event.visit_id:
+                        return cand.id
+                    c_num = (cand.container_number or '').strip().upper()
+                    if c_num and num and c_num == num:
+                        return cand.id
+                    if len(num) == 11 and len(c_num) == 11:
+                        if num[4:10] == c_num[4:10]:
+                            return cand.id
+                        if num[:4] == c_num[:4] and sum(a==b for a,b in zip(num[4:10], c_num[4:10])) >= 5:
+                            return cand.id
                 return event_id
             delta = timedelta(seconds=max_gap_seconds)
             direction_match = (GateEvent.event_type == event.event_type) | (GateEvent.event_type == 'UNKNOWN')

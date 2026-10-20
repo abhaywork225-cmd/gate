@@ -4,20 +4,108 @@ import os
 
 
 class SnapshotManager:
-    def __init__(self, root):
+    CATEGORIES = ('waiting', 'detected_in', 'detected_out')
+
+    def __init__(self, root, categorized: bool = True):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.categorized = bool(categorized)
+        if self.categorized:
+            for cat in self.CATEGORIES:
+                (self.root / cat).mkdir(parents=True, exist_ok=True)
+
+    def category_for(self, direction: str | None = None, is_waiting: bool = False, gate_id: str | None = None) -> str:
+        if not self.categorized:
+            return ''
+        if is_waiting:
+            return 'waiting'
+        d = str(direction or '').upper()
+        if d in ('EXIT', 'OUT', 'GATE_OUT'):
+            return 'detected_out'
+        if d in ('ENTRY', 'IN', 'GATE_IN'):
+            return 'detected_in'
+        g = str(gate_id or '').lower()
+        if any(k in g for k in ('out', 'exit')):
+            return 'detected_out'
+        return 'detected_in'
 
     def path(self, relative):
-        path = (self.root / relative).resolve()
-        if not path.is_relative_to(self.root) or path == self.root:
+        if not relative:
             raise ValueError('Invalid snapshot reference')
-        return path
+        rel_str = str(relative).replace('\\', '/').strip('/')
+        direct = (self.root / rel_str).resolve()
+        if direct.is_relative_to(self.root) and direct.exists():
+            return direct
+        if self.categorized and not any(rel_str.startswith(f'{c}/') for c in self.CATEGORIES):
+            for cat in self.CATEGORIES:
+                candidate = (self.root / cat / rel_str).resolve()
+                if candidate.is_relative_to(self.root) and candidate.exists():
+                    return candidate
+        if not direct.is_relative_to(self.root) or direct == self.root:
+            raise ValueError('Invalid snapshot reference')
+        return direct
 
-    def ensure_event_dir(self, event_id: str) -> Path:
-        event_dir = self.root / str(event_id)
+    def ensure_event_dir(self, event_id: str, category: str = 'detected_in') -> Path:
+        clean_id = str(event_id).replace('\\', '/').strip('/')
+        if not self.categorized:
+            event_dir = (self.root / clean_id).resolve()
+        elif any(clean_id.startswith(f'{c}/') for c in self.CATEGORIES):
+            event_dir = (self.root / clean_id).resolve()
+        else:
+            cat = category if category in self.CATEGORIES else 'detected_in'
+            event_dir = (self.root / cat / clean_id).resolve()
         event_dir.mkdir(parents=True, exist_ok=True)
         return event_dir
+
+    def promote_from_waiting(self, visit_id: str, direction: str | None = None) -> str:
+        """Promote files from snapshots/waiting/<visit_id> or legacy root/<visit_id>
+        to snapshots/detected_in/<visit_id> or snapshots/detected_out/<visit_id>."""
+        if not self.categorized:
+            return ''
+        import shutil
+        target_category = self.category_for(direction)
+        vid = str(visit_id).replace('\\', '/').strip('/')
+        for c in self.CATEGORIES:
+            if vid.startswith(f'{c}/'):
+                vid = vid[len(c)+1:]
+                break
+
+        target_dir = self.root / target_category / vid
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Promote from waiting/<vid>
+        waiting_dir = self.root / 'waiting' / vid
+        if waiting_dir.is_dir() and waiting_dir != target_dir:
+            for item in list(waiting_dir.iterdir()):
+                target_file = target_dir / item.name
+                if item.is_file():
+                    shutil.move(str(item), str(target_file))
+                elif item.is_dir():
+                    if target_file.exists():
+                        shutil.rmtree(str(target_file))
+                    shutil.move(str(item), str(target_file))
+            try:
+                waiting_dir.rmdir()
+            except OSError:
+                pass
+
+        # 2. Promote from legacy root/<vid>
+        legacy_dir = self.root / vid
+        if legacy_dir.is_dir() and legacy_dir != target_dir and vid not in self.CATEGORIES:
+            for item in list(legacy_dir.iterdir()):
+                target_file = target_dir / item.name
+                if item.is_file():
+                    shutil.move(str(item), str(target_file))
+                elif item.is_dir():
+                    if target_file.exists():
+                        shutil.rmtree(str(target_file))
+                    shutil.move(str(item), str(target_file))
+            try:
+                legacy_dir.rmdir()
+            except OSError:
+                pass
+
+        return target_category
 
     @staticmethod
     def compute_quality(image) -> float:
@@ -71,10 +159,10 @@ class SnapshotManager:
                 # normalize against the actual saved frame dimensions.
                 bw, bh = max(0.0, x2 - x1), max(0.0, y2 - y1)
                 area_ratio = (bw * bh) / float(w * h)
-                # OCR text regions can be narrow on the fixed gate views.  Keep
-                # a modest floor for readable text while still rejecting the
-                # tiny 13-pixel slivers that previously became proof images.
-                if bw < 35.0 or bh < 10.0 or area_ratio < 0.0005:
+                # OCR text regions must be reasonably close and legible at gate scale.
+                # Reject distant background slivers (< 28px tall or area_ratio < 0.0010)
+                # where the vehicle is already 50+ meters down the yard.
+                if bw < 50.0 or bh < 28.0 or area_ratio < 0.0010:
                     continue
                 # A clipped text box is not reliable proof, even if sharp.
                 if x1 <= 1.0 or y1 <= 1.0 or x2 >= w - 1.0 or y2 >= h - 1.0:
@@ -90,7 +178,8 @@ class SnapshotManager:
             # present in the event folder, causing cloud payloads to contain
             # only the primary camera image.
             image_path = str(snapshot.get('image_path') or '').replace('\\', '/')
-            return image_path.rsplit('/', 1)[-1] == f'{camera}.jpg'
+            filename = image_path.rsplit('/', 1)[-1]
+            return filename.startswith(f'{camera}_') or filename == f'{camera}.jpg'
         except Exception:
             return False
 
@@ -128,15 +217,27 @@ class SnapshotManager:
                 event_record.get('rear_snapshot_id'),
             ) if value
         }
+        def snap_score(item):
+            score = float(item.get('quality_score') or 0.0)
+            if item.get('id') in preferred_ids:
+                score += 500.0
+            try:
+                from app.events.cloud_dispatcher import snapshot_has_identity
+                c1 = event_record.get('container_number')
+                c2 = event_record.get('container_number_2') if event_record.get('is_twin') else None
+                if c1 and snapshot_has_identity(item, event_record, c1, 0.0):
+                    score += 2000.0
+                if c2 and snapshot_has_identity(item, event_record, c2, 0.0):
+                    score += 2000.0
+            except Exception:
+                pass
+            return score
+
         captures = []
         for items in by_camera.values():
-            preferred = [item for item in items if item.get('id') in preferred_ids]
-            if preferred:
-                captures.extend(preferred)
-            else:
-                captures.append(max(
-                    items, key=lambda item: (item['quality_score'], item.get('timestamp') or '')
-                ))
+            captures.append(max(
+                items, key=lambda item: (snap_score(item), item.get('timestamp') or '')
+            ))
 
         # Ensure all explicitly designated proof snapshots are included
         existing_ids = {c['id'] for c in captures}
@@ -221,12 +322,20 @@ class SnapshotManager:
         except Exception:
             return 0.0
 
-    def save_side_snapshot(self, event_id: str, camera_id: str, image, direction: str = '', text: str = '', force: bool = False) -> str:
-        """Saves or upgrades the compulsory side snapshot for camera_id under snapshots/{event_id}/{camera_id}.jpg."""
+    def save_side_snapshot(self, event_id: str, camera_id: str, image, direction: str = '', text: str = '', force: bool = False, category: str | None = None) -> str:
+        """Saves or upgrades the compulsory side snapshot for camera_id under snapshots/{category}/{event_id}/{camera_id}.jpg."""
         import cv2
-        self.ensure_event_dir(event_id)
-        relative = f'{event_id}/{camera_id}.jpg'
+        clean_folder = str(event_id).replace('\\', '/').strip('/')
+        if not self.categorized or any(clean_folder.startswith(f'{c}/') for c in self.CATEGORIES):
+            relative_dir = clean_folder
+        else:
+            cat = category or self.category_for(direction)
+            relative_dir = f'{cat}/{clean_folder}' if cat else clean_folder
+
+        self.ensure_event_dir(relative_dir)
+        relative = f'{relative_dir}/{camera_id}.jpg'
         final = self.path(relative)
+        final.parent.mkdir(parents=True, exist_ok=True)
         meta_quality_path = final.with_suffix('.quality')
 
         new_quality = self.compute_quality(image)
@@ -252,13 +361,21 @@ class SnapshotManager:
             temp_img.unlink(missing_ok=True)
         return relative
 
-    def save_best_crop(self, event_id: str, slot_pos: str, crop, text: str = '', force: bool = False) -> str:
-        """Saves or upgrades the highest-clarity OCR proof crop under snapshots/{event_id}/crop_{slot}_best.jpg."""
+    def save_best_crop(self, event_id: str, slot_pos: str, crop, text: str = '', force: bool = False, direction: str = '', category: str | None = None) -> str:
+        """Saves or upgrades the highest-clarity OCR proof crop under snapshots/{category}/{event_id}/crop_{slot}_best.png."""
         import cv2
-        self.ensure_event_dir(event_id)
+        clean_folder = str(event_id).replace('\\', '/').strip('/')
+        if not self.categorized or any(clean_folder.startswith(f'{c}/') for c in self.CATEGORIES):
+            relative_dir = clean_folder
+        else:
+            cat = category or self.category_for(direction)
+            relative_dir = f'{cat}/{clean_folder}' if cat else clean_folder
+
+        self.ensure_event_dir(relative_dir)
         slot_clean = slot_pos.lower().replace(' ', '_')
-        relative = f'{event_id}/crop_{slot_clean}_best.png'
+        relative = f'{relative_dir}/crop_{slot_clean}_best.png'
         final = self.path(relative)
+        final.parent.mkdir(parents=True, exist_ok=True)
         meta_quality_path = final.with_suffix('.quality')
 
         new_quality = self.compute_quality(crop)
@@ -287,7 +404,7 @@ class SnapshotManager:
             temp_crop.unlink(missing_ok=True)
         return relative
 
-    def save(self, snapshot_id, observation, event_id=None):
+    def save(self, snapshot_id, observation, event_id=None, direction=None, category=None):
         import cv2
         image = observation.image.copy()
 
@@ -297,13 +414,21 @@ class SnapshotManager:
         box_color = (0, 200, 255) if is_rear else (40, 190, 80)
 
         # Save clean raw camera photo without drawing boxes over text
-        # (Overlays over the numbers obscure human verification on the portal)
         ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 92])
         if not ok:
             raise OSError('Snapshot encoding failed')
         is_rear = getattr(observation, 'slot_position', 'FRONT') == 'REAR' or observation.origin_key.endswith(':rear')
         slot_suffix = '_rear' if is_rear else ''
-        relative = f'{event_id}/{observation.detection.camera_id}_{snapshot_id}{slot_suffix}.jpg' if event_id else f'{snapshot_id}.jpg'
+        if event_id:
+            clean_folder = str(event_id).replace('\\', '/').strip('/')
+            if not self.categorized or any(clean_folder.startswith(f'{c}/') for c in self.CATEGORIES):
+                relative_dir = clean_folder
+            else:
+                cat = category or self.category_for(direction or getattr(observation, 'direction', None), gate_id=getattr(observation, 'gate_id', None))
+                relative_dir = f'{cat}/{clean_folder}' if cat else clean_folder
+            relative = f'{relative_dir}/{observation.detection.camera_id}_{snapshot_id}{slot_suffix}.jpg'
+        else:
+            relative = f'{snapshot_id}.jpg'
         final = self.path(relative)
         final.parent.mkdir(parents=True, exist_ok=True)
         quality_path = final.with_suffix('.quality')
@@ -327,19 +452,25 @@ class SnapshotManager:
     def save_camera_frame(self, snapshot_id, event_id, camera_id, image, direction='', text=''):
         return self.save_side_snapshot(event_id, camera_id, image, direction=direction, text=text)
 
-    def save_event_json(self, event_id: str, event_data: dict) -> Path:
+    def save_event_json(self, event_id: str, event_data: dict, direction: str | None = None) -> Path:
         import json
         visit_id = event_data.get('visit_id')
-        event_dir = self.path(str(visit_id)) if visit_id else self.path(str(event_id))
+        raw_vid = str(visit_id or event_id).replace('\\', '/').strip('/')
+        if not self.categorized or any(raw_vid.startswith(f'{c}/') for c in self.CATEGORIES):
+            vid = raw_vid
+        else:
+            cat = self.category_for(direction or event_data.get('event_type'))
+            vid = f'{cat}/{raw_vid}' if cat else raw_vid
+
+        event_dir = self.path(vid)
         event_dir.mkdir(parents=True, exist_ok=True)
         if visit_id:
             visit = {'visit_id':visit_id,'gate_id':event_data.get('gate_id'),
                      'direction':event_data.get('event_type'),
                      'container_records':sorted({event_id,*(p.stem[len('event_'):] for p in event_dir.glob('event_*.json'))}),
                      'context_capture_files':sorted(p.name for p in event_dir.glob('*_context_*.jpg'))}
-            manifest = self.path(f'{visit_id}/visit.json')
+            manifest = event_dir / 'visit.json'
             temporary = manifest.with_suffix('.json.tmp')
-            import json
             temporary.write_text(json.dumps(visit,indent=2))
             os.replace(temporary,manifest)
         final_path = event_dir / (f'event_{event_id}.json' if visit_id else 'event.json')

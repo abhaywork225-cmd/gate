@@ -7,7 +7,7 @@
       0.8391264353728914,
       1.0
     ],
-    "entry_line": 0.1,
+    "entry_line": 0.36,
     "exit_line": 0.79,
     "gate_exit_axis": "x",
     "gate_exit_positive": true,
@@ -21,8 +21,8 @@
       0.8095970586873608,
       1.0
     ],
-    "entry_line": 0.1,
-    "exit_line": 0.5,
+    "entry_line": 0.9,
+    "exit_line": 0.36,
     "gate_exit_axis": "y",
     "gate_exit_positive": false,
     "version": 1
@@ -35,8 +35,8 @@
       1.0,
       1.0
     ],
-    "entry_line": 0.1,
-    "exit_line": 0.21,
+    "entry_line": 0.9,
+    "exit_line": 0.3,
     "gate_exit_axis": "x",
     "gate_exit_positive": false,
     "version": 1
@@ -44,13 +44,13 @@
   "gate-out-1": {
     "lanes": [],
     "occupancy_roi": [
-      0.16733311577706844,
-      0.34852630482800884,
-      1.0,
+      0.10919715542742991,
+      0.08629081999451295,
+      0.9978468350576188,
       1.0
     ],
-    "entry_line": 0.1,
-    "exit_line": 0.4,
+    "entry_line": 0.9,
+    "exit_line": 0.15,
     "gate_exit_axis": "y",
     "gate_exit_positive": false,
     "version": 1
@@ -59,13 +59,13 @@
     "lanes": [],
     "occupancy_roi": [
       0.0,
-      0.3439328476420677,
-      0.8566595027799252,
+      0.22212500275354105,
+      0.7699169587661788,
       1.0
     ],
-    "entry_line": 0.1,
-    "exit_line": 0.74,
-    "gate_exit_axis": "x",
+    "entry_line": 0.26,
+    "exit_line": 0.94,
+    "gate_exit_axis": "y",
     "gate_exit_positive": true,
     "version": 1
   }

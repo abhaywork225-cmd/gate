@@ -380,14 +380,40 @@ class PassageCollector:
                 self.active.pop(identity)
                 continue
             if passage.last_seen != frame.timestamp:
-                if (passage.last_measured is None or
-                        (frame.timestamp-passage.last_measured).total_seconds() > self.settings.gate_observation_gap_seconds):
+                # Virtual Laser Line: check if container or vehicle is dwelling inside gate ROI
+                h, w = frame.image.shape[:2]
+                rx1, ry1, rx2, ry2 = camera.occupancy_roi
+                still_dwelling = any(
+                    (d.class_name in ('container', 'truck', 'trailer', 'vehicle') or
+                     (d.class_name == 'container_number' and d.confidence >= 0.3)) and
+                    (rx1 - 0.05 <= (d.bbox[0] + d.bbox[2]) / (2 * w) <= rx2 + 0.05) and
+                    (ry1 - 0.05 <= (d.bbox[1] + d.bbox[3]) / (2 * h) <= ry2 + 0.05)
+                    for d in detections
+                )
+                if still_dwelling:
+                    # Vehicle is dwelling inside gate: keep passage open, do not timeout
                     passage.clear_since = None
-                passage.clear_since = passage.clear_since or frame.timestamp
-                if (frame.timestamp-passage.clear_since).total_seconds() >= self.settings.gate_clear_seconds:
+                else:
+                    if (passage.last_measured is None or
+                            (frame.timestamp-passage.last_measured).total_seconds() > self.settings.gate_observation_gap_seconds):
+                        passage.clear_since = None
+                    passage.clear_since = passage.clear_since or frame.timestamp
+                    if (frame.timestamp-passage.clear_since).total_seconds() >= self.settings.gate_clear_seconds:
+                        passage.closed = True
+                        passage.closed_at = frame.timestamp
+                        self.active.pop(identity)
+                        if passage.saved:
+                            self.recent[passage.id] = passage
+
+            # Virtual Laser Line: immediate clearance if vehicle crossed the exit tripwire
+            if not passage.closed and passage.bbox:
+                by1, by2 = passage.bbox[1], passage.bbox[3]
+                cy = (by1 + by2) / (2 * frame.image.shape[0])
+                if (camera.direction in ('ENTRY', 'IN') and cy > (camera.occupancy_roi[3] + 0.02)) or \
+                   (camera.direction in ('EXIT', 'OUT') and (cy > 0.95 or cy < 0.05)):
                     passage.closed = True
                     passage.closed_at = frame.timestamp
-                    self.active.pop(identity)
+                    self.active.pop(identity, None)
                     if passage.saved:
                         self.recent[passage.id] = passage
             passage.last_measured = frame.timestamp
@@ -408,20 +434,31 @@ class PassageCollector:
             return
         region.sequences.add(sequence)
         region.pending = max(0, region.pending-1)
-        if region.best_any is None or (validation.valid_check_digit,validation.valid_format,validation.confidence) > (
-                region.best_any[0].valid_check_digit,region.best_any[0].valid_format,region.best_any[0].confidence):
-            region.best_any = (validation,job)
+        x1,y1,x2,y2 = map(int,job.detection.bbox)
+        crop = job.frame.image[max(0,y1):y2,max(0,x1):x2]
+        var = float(cv2.Laplacian(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),cv2.CV_64F).var()) if crop.size else 0
+        box_area = max(1.0, float((x2 - x1) * (y2 - y1)))
+        h_img, w_img = job.frame.image.shape[:2]
+        edge_penalty = 0.25 if (job.detection.bbox[0] < 0.05 * w_img or job.detection.bbox[2] > 0.95 * w_img) else 1.0
+        quality = box_area * math.log1p(min(var, 2500.0)) * (0.5 + 0.5 * validation.confidence) * edge_penalty
+
+        if region.best_any is None:
+            region.best_any = (validation, job)
+            region.best_quality = quality
+        else:
+            old_val = region.best_any[0]
+            if (validation.valid_check_digit, validation.valid_format) > (old_val.valid_check_digit, old_val.valid_format):
+                region.best_any = (validation, job)
+                region.best_quality = quality
+            elif (validation.valid_check_digit, validation.valid_format) == (old_val.valid_check_digit, old_val.valid_format):
+                if quality > getattr(region, 'best_quality', 0):
+                    region.best_any = (validation, job)
+                    region.best_quality = quality
+
         if validation.valid_check_digit and validation.confidence >= self.settings.ocr_min_confidence:
             number = validation.normalized_text
             region.votes[number] += 1
             region.vote_sequences.setdefault(number,set()).add(sequence)
-            x1,y1,x2,y2 = map(int,job.detection.bbox)
-            crop = job.frame.image[max(0,y1):y2,max(0,x1):x2]
-            var = float(cv2.Laplacian(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),cv2.CV_64F).var()) if crop.size else 0
-            box_area = max(1.0, float((x2 - x1) * (y2 - y1)))
-            h_img, w_img = job.frame.image.shape[:2]
-            edge_penalty = 0.25 if (job.detection.bbox[0] < 0.05 * w_img or job.detection.bbox[2] > 0.95 * w_img) else 1.0
-            quality = box_area * math.log1p(min(var, 2500.0)) * (0.5 + 0.5 * validation.confidence) * edge_penalty
             previous = region.reads.get(number)
             if previous:
                 old_validation, old_job = previous
@@ -584,10 +621,18 @@ def final_captures(group, confirmations):
     }
     if reliable_twin:
         bundles = [list(numbers)]
-    elif confirmed_numbers:
-        bundles = [[n] for n in sorted(confirmed_numbers)]
-    elif numbers:
-        best_candidate = max(numbers, key=lambda n: sum(c for _, _, c in numbers[n]))
+    elif confirmed_numbers or numbers:
+        # A non-twin truck passage carries a single container.
+        # Select the single best verified identity across all cameras and regions.
+        pool = confirmed_numbers if confirmed_numbers else numbers
+        def _candidate_score(n):
+            records = pool[n]
+            total_votes = sum(c for _, _, c in records)
+            has_check = any(r.reads.get(n) and getattr(r.reads[n][0], 'valid_check_digit', False) for _, r, _ in records)
+            max_conf = max((getattr(r.reads[n][0], 'confidence', 0.0) for _, r, _ in records if n in r.reads), default=0.0)
+            prefix_bonus = 50.0 if n.startswith(('MSKU', 'MEDU', 'MAEU', 'CMAU', 'TCNU', 'TGHU', 'TRHU', 'WHSU', 'SPSU', 'KKTU', 'TEMU', 'TIIU')) else 0.0
+            return (1000.0 if has_check else 0.0) + (total_votes * 10.0) + max_conf + prefix_bonus
+        best_candidate = max(pool, key=_candidate_score)
         bundles = [[best_candidate]]
     else:
         bundles = []

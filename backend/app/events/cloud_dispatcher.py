@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import io
 import json
 import logging
+from pathlib import Path
 from queue import Empty, Full, Queue
 import threading
 import time
@@ -70,9 +71,10 @@ def verified_cloud_identity(event, observation, number, minimum):
     ocr = getattr(observation, 'ocr', None)
     if ocr:
         sources.append((ocr.raw_text, ocr.confidence))
+    threshold = min(float(minimum or 0.50), 0.50)
     for raw, confidence in sources:
         value = ContainerValidator().validate(OCRRead(raw, float(confidence or 0)))
-        if value.valid_check_digit and value.normalized_text == number and value.confidence >= minimum:
+        if (value.valid_check_digit or (value.valid_format and float(value.confidence or 0) >= 0.50)) and value.normalized_text == number and float(value.confidence or 0) >= threshold:
             return True
     return False
 
@@ -87,7 +89,7 @@ def snapshot_has_identity(snapshot, event, number, minimum):
         if value.valid_check_digit and value.normalized_text == number and value.confidence >= minimum:
             ids.add(reading.get('detection_id'))
     return any(d.get('id') in ids and d.get('camera_id') == snapshot.get('camera_id')
-               and _within_capture_window(d.get('timestamp'), snapshot.get('timestamp'), .05)
+               and _within_capture_window(d.get('timestamp'), snapshot.get('timestamp'), 3.0)
                for d in event.get('detections', []))
 
 
@@ -152,6 +154,42 @@ def sanitize_payload_for_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
     return sanitized
 
 
+def resolve_camera_image_type(camera_id: str, camera_configs: Optional[dict] = None) -> str:
+    """Map camera ID or role to FRONT or REAR.
+    gate-out-1 / gate-in-3 are REAR container door cameras.
+    gate-out-2 / gate-in-1 / gate-in-2 are FRONT / cabin / approaching cameras.
+    """
+    c = (camera_id or '').lower()
+    if camera_configs and camera_id in camera_configs:
+        cfg = camera_configs[camera_id]
+        role = str(getattr(cfg, 'role', None) or (cfg.get('role') if isinstance(cfg, dict) else '')).upper()
+        if 'REAR' in role or 'BACK' in role:
+            return 'REAR'
+        if 'FRONT' in role or 'CABIN' in role or 'TOP' in role:
+            return 'FRONT'
+    if 'out-1' in c or 'in-3' in c or 'in-2' in c or any(k in c for k in ('rear', 'back', '-3')):
+        return 'REAR'
+    return 'FRONT'
+
+
+def resolve_container_size(iso_code: Optional[str], container_size: Optional[str] = None,
+                           is_twin: bool = False, aspect_ratio: Optional[float] = None) -> str:
+    """Determine container size ('20', '40', '45'). Never returns None."""
+    if is_twin:
+        return '20'
+    iso = (iso_code or '').strip().upper()
+    cs = (container_size or '').strip().upper()
+    if '20' in cs or iso.startswith('2'):
+        return '20'
+    if '45' in cs or iso.startswith('L'):
+        return '45'
+    if '40' in cs or iso.startswith('4'):
+        return '40'
+    if aspect_ratio is not None and aspect_ratio > 0:
+        return '20' if aspect_ratio < 1.85 else '40'
+    return '40'
+
+
 class ProsperSession:
     """Manages authentication tokens and HTTP requests to Prosper Smart Yard."""
 
@@ -201,9 +239,6 @@ class ProsperSession:
                     username = getattr(self.settings, 'prosper_username', None) or self.settings.prosper_email or 'abhay@prosperinfotech.com'
                     configured_pw = self.settings.prosper_password.get_secret_value() if self.settings.prosper_password else ''
                     passwords_to_try = [configured_pw] if configured_pw else []
-                    for candidate in ['Test@123', 'Prosper@123', 'Admin@123']:
-                        if candidate not in passwords_to_try:
-                            passwords_to_try.append(candidate)
 
                     login_urls = [self.auth_url]
                     alt_url = f'{self.base_url}/api/auth/login'
@@ -250,10 +285,19 @@ class ProsperSession:
                             break
 
                     if self._token:
+                        self._auth_error = None
                         headers['Authorization'] = f'Bearer {self._token}'
                     elif res is not None:
+                        if res.status_code == 423:
+                            self._last_auth_attempt = now + 60
+                            self._auth_error = 'Cloud account temporarily locked by auth server (HTTP 423). Auto-refreshing...'
+                        elif res.status_code in (401, 403):
+                            self._auth_error = f'Cloud authentication failed ({res.status_code}). Invalid credentials.'
+                        else:
+                            self._auth_error = f'Auth server returned HTTP {res.status_code}'
                         log.warning('prosper_auth_login_failed', extra={'status_code': res.status_code, 'body': res.text[:200]})
                     else:
+                        self._auth_error = 'Unable to connect to auth server'
                         log.warning('prosper_auth_login_unreachable: Unable to connect to auth server (%s)', self.auth_url)
 
         if self.site_id:
@@ -370,13 +414,23 @@ class ProsperSession:
             except Exception as e:
                 log.warning('prosper_audit_callback_failed', extra={'error': str(e)})
 
+        try:
+            log_dir = Path(getattr(self.settings, 'log_directory', 'logs'))
+            log_dir.mkdir(parents=True, exist_ok=True)
+            sync_log_file = log_dir / 'prosper_cloud_sync.log'
+            with sync_log_file.open('a', encoding='utf-8') as f:
+                f.write(json.dumps(audit_entry, default=str) + '\n')
+        except Exception as e:
+            log.warning('prosper_sync_file_log_failed', extra={'error': str(e)})
+
     def post_gate_event(self, payload: Dict[str, Any]) -> bool | str:
         """Send Gate Event to Prosper Smart Yard."""
         headers = self.get_auth_headers()
         if 'Authorization' not in headers and 'x-api-key' not in headers:
-            log.info('prosper_gate_event_postponed_no_auth: Cloud authentication is not available (waiting for valid credentials or token). Dispatch buffered locally.')
+            auth_msg = getattr(self, '_auth_error', None) or 'Cloud authentication unavailable'
+            log.info('prosper_gate_event_postponed_no_auth: %s. Dispatch buffered locally.', auth_msg)
             self._record_audit(payload, getattr(self, 'events_url', self.base_url), None,
-                               'Cloud authentication unavailable', 0.0, 'OFFLINE', 'No auth credentials or token available')
+                               auth_msg, 0.0, 'OFFLINE', auth_msg)
             return 'OFFLINE'
 
         headers['Content-Type'] = 'application/json'
@@ -576,22 +630,72 @@ class CloudOutboxDispatcher:
             self._worker_thread.join(timeout=timeout)
         log.info('prosper_cloud_dispatcher_stopped')
 
+    def is_dispatchable_event(self, ev: dict | None, min_confidence: float = 0.50, allow_synced: bool = False) -> bool:
+        """
+        Check if an event meets requirements to be dispatched to Prosper site:
+        1. Must not be already synced to cloud (unless allow_synced=True for re-dispatch).
+        2. Must NOT be an unreadable event (status != 'UNREADABLE').
+        3. Must have a valid container number (not None/empty/'UNREADABLE'/'UNCONFIRMED').
+        4. If twin event, must have both valid distinct container numbers.
+        5. Must have OCR confidence >= min_confidence (50% / 0.50).
+        """
+        if not ev:
+            return False
+        if not allow_synced and ev.get('cloud_synced'):
+            return False
+        if ev.get('status') == 'UNREADABLE':
+            return False
+
+        c1 = ev.get('container_number')
+        if not c1 or str(c1).strip().upper() in ('', 'NONE', 'UNREADABLE', 'UNCONFIRMED'):
+            return False
+
+        if ev.get('is_twin'):
+            c2 = ev.get('container_number_2')
+            if not c2 or str(c2).strip().upper() in ('', 'NONE', 'UNREADABLE', 'UNCONFIRMED') or c2 == c1:
+                return False
+
+        ocr_results = ev.get('ocr_results', [])
+        if ocr_results:
+            c1_confs = [
+                float(o.get('confidence', 0.0)) for o in ocr_results
+                if o.get('normalized_text') == c1 or (o.get('raw_text', '').replace(' ', '') == c1)
+            ]
+            best_conf = max(c1_confs, default=max((float(o.get('confidence', 0.0)) for o in ocr_results), default=0.0))
+            if best_conf < min_confidence:
+                return False
+            if ev.get('is_twin'):
+                c2_confs = [
+                    float(o.get('confidence', 0.0)) for o in ocr_results
+                    if o.get('normalized_text') == c2 or (o.get('raw_text', '').replace(' ', '') == c2)
+                ]
+                best_conf_2 = max(c2_confs, default=0.0)
+                if best_conf_2 < min_confidence:
+                    return False
+        else:
+            if ev.get('status') != 'CONFIRMED':
+                return False
+
+        return True
+
     def enqueue(self, obs: Any, event_id: str, image_bytes: Optional[bytes] = None,
                 payload: Optional[dict] = None, delay_seconds: float = 0.0):
-        """Enqueue confirmed gate event for background dispatch."""
+        """Enqueue gate event with >= 50% OCR accuracy for background dispatch."""
         if not self.enabled:
             return
-        if not getattr(obs, 'confirmed', True):
-            return
+        if obs is not None:
+            conf = getattr(getattr(obs, 'ocr', None), 'confidence', 0.0) or 0.0
+            if not getattr(obs, 'confirmed', False) and float(conf) < 0.50:
+                return
         if not self.auto_dispatch:
             log.info('prosper_event_held_auto_dispatch_paused', extra={'event_id': event_id})
             return
 
-        # Do not re-enqueue if already synced in database or not confirmed
+        # Do not re-enqueue if already synced in database, unreadable, or below 50% OCR confidence
         if self.repository:
             try:
                 ev = self.repository.event(event_id)
-                if ev and (ev.get('cloud_synced') or ev.get('status') != 'CONFIRMED' or not ev.get('container_number')):
+                if ev and not self.is_dispatchable_event(ev):
                     return
                 canonical = self.repository.canonical_event_id(event_id)
                 if canonical and canonical != event_id:
@@ -657,11 +761,20 @@ class CloudOutboxDispatcher:
             if self.queue.qsize() > 0:
                 return
 
-            log.info('prosper_sweep_offline_backlog_found', extra={'count': len(unsynced)})
+            dispatchable_items = []
             for ev in unsynced:
+                event_id = ev['id']
+                full_ev = self.repository.event(event_id) if hasattr(self.repository, 'event') else ev
+                if self.is_dispatchable_event(full_ev):
+                    dispatchable_items.append(event_id)
+
+            if not dispatchable_items:
+                return
+
+            log.info('prosper_sweep_offline_backlog_found', extra={'count': len(dispatchable_items)})
+            for event_id in dispatchable_items:
                 if self._stop.is_set():
                     break
-                event_id = ev['id']
                 try:
                     self.queue.put_nowait({
                         'event_id': event_id,
@@ -727,12 +840,13 @@ class CloudOutboxDispatcher:
                 camera_id = choice[3]['camera_id']
                 if camera_id not in by_camera or choice[0] > by_camera[camera_id][0]:
                     by_camera[camera_id] = choice
-            images = [{'ImageType': slot, 'CameraId': entry[3]['camera_id'], 'CapturedAt': entry[3]['timestamp'],
+            images = [{'ImageType': resolve_camera_image_type(entry[3]['camera_id']), 'CameraId': entry[3]['camera_id'], 'CapturedAt': entry[3]['timestamp'],
                        'Image': 'data:image/jpeg;base64,' + base64.b64encode(proof_jpeg(entry[4],entry[3],event)).decode()}
                       for entry in by_camera.values()]
+            resolved_size = resolve_container_size(None, None, is_twin=bool(event.get('is_twin')))
             containers.append({'ContainerNumber': number, 'ContainerNumberConfidence': value.confidence,
                 'DetectionConfidence': 0.0, 'ValidationStatus': value.validation_status,
-                'Position': slot if event.get('is_twin') else 'SINGLE', 'Size': None, 'SizeCode': None,
+                'Position': slot if event.get('is_twin') else 'SINGLE', 'Size': resolved_size, 'SizeCode': '22G1' if resolved_size == '20' else '42G1',
                 'Images': images})
         if not containers:
             raise ValueError('No captured source proof is available; retry after evidence is saved')
@@ -747,34 +861,55 @@ class CloudOutboxDispatcher:
         numbers = [event.get('container_number')]
         if event.get('is_twin'):
             numbers.append(event.get('container_number_2'))
+        cam_cfgs = getattr(self.settings, 'cameras', lambda: {})()
         containers = []
         for index,number in enumerate(numbers):
             by_camera = {}
+            target_snap_id = event.get('rear_snapshot_id') if (index == 1 and event.get('is_twin')) else event.get('primary_snapshot_id')
+            id_snaps = [s for s in event.get('snapshots', []) if number and snapshot_has_identity(s, event, number, 0.0)]
+            ref_ts = id_snaps[0].get('timestamp') if id_snaps else event.get('timestamp')
+
             for snap in event.get('snapshots',[]):
-                if number and not snapshot_has_identity(snap,event,number,0.0):
-                    continue
+                if event.get('is_twin') and number:
+                    other_num = event.get('container_number_2' if index == 0 else 'container_number')
+                    if other_num and snapshot_has_identity(snap, event, other_num, 0.0):
+                        continue
                 path = self.snapshots.path(snap['image_path'])
                 if not path.is_file(): continue
                 data = path.read_bytes()
                 decoded = cv2.imdecode(np.frombuffer(data,dtype=np.uint8),cv2.IMREAD_COLOR)
                 if decoded is None or decoded.size==0: continue
                 quality = self.snapshots.compute_quality(decoded)
+                score = float(quality)
+                if number and snapshot_has_identity(snap, event, number, 0.0):
+                    score += 2000.0
+                elif target_snap_id and snap.get('id') == target_snap_id:
+                    score += 1000.0
+                if ref_ts and not _within_capture_window(snap.get('timestamp'), ref_ts, float(getattr(self.settings, 'cross_camera_view_window_seconds', 8.0) or 8.0)):
+                    continue
                 camera = snap['camera_id']
-                if camera not in by_camera or quality > by_camera[camera][0]:
-                    by_camera[camera] = (quality,snap,data)
+                if camera not in by_camera or score > by_camera[camera][0]:
+                    by_camera[camera] = (score,snap,data)
             if not by_camera:
                 raise ValueError('Final capture has no retained source proof')
             position = ('FRONT' if index==0 else 'REAR') if event.get('is_twin') else 'SINGLE'
-            img_type = 'REAR' if index == 1 else 'FRONT'
-            images = [{'ImageType':img_type,'CameraId':snap['camera_id'],'CapturedAt':snap['timestamp'],
-                       'Image':'data:image/jpeg;base64,'+base64.b64encode(data).decode()}
+            images = [{'ImageType': resolve_camera_image_type(snap['camera_id'], cam_cfgs),
+                       'CameraId': snap['camera_id'],
+                       'CapturedAt': snap['timestamp'],
+                       'Image': 'data:image/jpeg;base64,' + base64.b64encode(data).decode()}
                       for _,snap,data in by_camera.values()]
             matching = [o for o in event.get('ocr_results',[]) if number and o.get('normalized_text')==number]
             confidence = max((o.get('confidence',0) for o in matching),default=0)
+            iso_code = event.get('iso_code_1' if index==0 else 'iso_code_2')
+            c_size_str = event.get('container_size' if index==0 else 'container_size_2')
+            resolved_size = resolve_container_size(iso_code, c_size_str, is_twin=bool(event.get('is_twin')))
             containers.append({'ContainerNumber':number,'ContainerNumberConfidence':confidence,
                 'ValidationStatus':'VALID' if number else 'UNREADABLE',
                 'RecognitionStatus':('CONFIRMED' if event.get('status')=='CONFIRMED' else 'UNCONFIRMED') if number else 'UNREADABLE',
-                'Position':position,'Size':None,'SizeCode':event.get('iso_code_1' if index==0 else 'iso_code_2'),
+                'Position':position,
+                'Size':resolved_size,
+                'ContainerSize':f"{resolved_size} FT",
+                'SizeCode':iso_code or ('22G1' if resolved_size == '20' else '42G1'),
                 'Images':images})
         return {'id':event['id'],'VisitId':'VISIT-'+event['id'],
             'EventType':'GATE_OUT' if event.get('event_type') in ('EXIT','OUT','GATE_OUT') else 'GATE_IN',
@@ -820,8 +955,6 @@ class CloudOutboxDispatcher:
                 for key in source_evidence:
                     event_record[key] = list(event_record.get(key, [])) + source_evidence[key]
             numbers = [event_record.get('container_number'), event_record.get('container_number_2')]
-            event_record['snapshots'] = [snap for snap in event_record.get('snapshots', [])
-                if any(number and snapshot_has_identity(snap, event_record, number, 0.0) for number in numbers)]
             manifest = self.snapshots.build_evidence_manifest(
                 event_record,
                 min_quality=getattr(self.settings, 'cloud_min_proof_quality', 2.5),
@@ -870,23 +1003,6 @@ class CloudOutboxDispatcher:
                     best_score = -1.0
                     for snap in snaps:
                         try:
-                            if not snapshot_has_identity(snap, event_record, cntr1, 0.0):
-                                continue
-                            if valid_identity_ids:
-                                snap_ts = snap.get('timestamp')
-                                observed = any(
-                                    d.get('camera_id') == snap.get('camera_id') and
-                                    (
-                                        d.get('id') in valid_identity_ids or
-                                        _within_capture_window(d.get('timestamp'), snap_ts)
-                                    )
-                                    for d in event_record.get('detections', [])
-                                )
-                                if not observed:
-                                    image_path = str(snap.get('image_path') or '').replace('\\', '/')
-                                    is_companion = image_path.rsplit('/', 1)[-1] == f'{snap.get("camera_id")}.jpg'
-                                    if not is_companion:
-                                        continue
                             snap_p = self.snapshots.path(snap['image_path'])
                             if not snap_p.is_file():
                                 continue
@@ -897,8 +1013,9 @@ class CloudOutboxDispatcher:
                             quality = self.snapshots.compute_quality(decoded)
                             if not self._proof_is_usable(decoded, quality):
                                 continue
-                            score = quality
-                            if primary_snap_id and snap.get('id') == primary_snap_id:
+                            if snapshot_has_identity(snap, event_record, cntr1, 0.0):
+                                score += 2000.0
+                            elif primary_snap_id and snap.get('id') == primary_snap_id:
                                 score += 1000.0
                             if score > best_score:
                                 best_score = score
@@ -919,16 +1036,11 @@ class CloudOutboxDispatcher:
                         return (2, c)
                     return (3, c)
 
-                def _cam_image_type(c_id):
-                    c = (c_id or '').lower()
-                    if any(k in c for k in ('3', 'rear', 'back')):
-                        return 'REAR'
-                    return 'FRONT'
-
+                cam_cfgs = getattr(self.settings, 'cameras', lambda: {})()
                 for cam_id in sorted(best_by_camera.keys(), key=_cam_sort_key):
                     snap, data = best_by_camera[cam_id]
                     c1_images.append({
-                        'ImageType': _cam_image_type(cam_id),
+                        'ImageType': resolve_camera_image_type(cam_id, cam_cfgs),
                         'CameraId': cam_id,
                         'CapturedAt': _iso_utc(snap.get('timestamp') or (obs.detection.frame_timestamp if obs else None)),
                         'Image': f"data:image/jpeg;base64,{base64.b64encode(proof_jpeg(data, snap, event_record)).decode('utf-8')}"
@@ -965,20 +1077,15 @@ class CloudOutboxDispatcher:
                     cs1 = cs1 or ''
                 except Exception:
                     pass
-            if '20' in cs1 or iso_s1.startswith('2'):
-                size_1 = '20'
-            elif '45' in cs1 or iso_s1.startswith('L'):
-                size_1 = '45'
-            else:
-                size_1 = '40'
+            size_1 = resolve_container_size(iso_s1, cs1, is_twin=is_twin)
             conf_1 = identity_confidence(event_record, obs, cntr1)
             containers_list.append({
                 'ContainerNumber': cntr1,
                 'DetectionConfidence': round(detection_confidence(event_record, obs, cntr1), 2),
                 'ContainerNumberConfidence': round(conf_1, 2),
                 'Size': size_1,
-                'ContainerSize': cs1 or None,
-                'SizeCode': iso_s1 or None,
+                'ContainerSize': cs1 or f"{size_1} FT",
+                'SizeCode': iso_s1 or ('22G1' if size_1 == '20' else '42G1'),
                 'Position': 'FRONT' if is_twin else 'SINGLE',
                 'Images': c1_images
             })
@@ -1018,8 +1125,6 @@ class CloudOutboxDispatcher:
                     best_score = -1.0
                     for snap in snaps:
                         try:
-                            if not snapshot_has_identity(snap, event_record, cntr2, 0.0):
-                                continue
                             snap_p = self.snapshots.path(snap['image_path'])
                             if not snap_p.is_file():
                                 continue
@@ -1030,8 +1135,10 @@ class CloudOutboxDispatcher:
                             quality = self.snapshots.compute_quality(decoded)
                             if not self._proof_is_usable(decoded, quality):
                                 continue
-                            score = quality
-                            if rear_snap_id and snap.get('id') == rear_snap_id:
+                            score = float(quality)
+                            if snapshot_has_identity(snap, event_record, cntr2, 0.0):
+                                score += 2000.0
+                            elif rear_snap_id and snap.get('id') == rear_snap_id:
                                 score += 1000.0
                             if (snap.get('image_path') or '').endswith('_rear.jpg'):
                                 score += 500.0
@@ -1053,10 +1160,11 @@ class CloudOutboxDispatcher:
                     if best_snap and best_data:
                         best_c2_by_camera[cam_id] = (best_snap, best_data)
 
+                cam_cfgs = getattr(self.settings, 'cameras', lambda: {})()
                 for cam_id in sorted(best_c2_by_camera.keys()):
                     snap, data = best_c2_by_camera[cam_id]
                     c2_images.append({
-                        'ImageType': 'REAR',
+                        'ImageType': resolve_camera_image_type(cam_id, cam_cfgs),
                         'CameraId': cam_id,
                         'CapturedAt': _iso_utc(snap.get('timestamp') or (obs.detection.frame_timestamp if obs else None)),
                         'Image': f"data:image/jpeg;base64,{base64.b64encode(proof_jpeg(data, snap, event_record)).decode('utf-8')}"
@@ -1075,15 +1183,15 @@ class CloudOutboxDispatcher:
                     cs2 = cs2 or ''
                 except Exception:
                     pass
-            size_2 = '20' if ('20' in cs2 or iso_s2.startswith('2')) else ('45' if ('45' in cs2 or iso_s2.startswith('L')) else '40')
+            size_2 = resolve_container_size(iso_s2, cs2, is_twin=is_twin)
             conf_2 = identity_confidence(event_record, obs, cntr2)
             containers_list.append({
                 'ContainerNumber': cntr2,
                 'DetectionConfidence': round(detection_confidence(event_record, obs, cntr2), 2),
                 'ContainerNumberConfidence': round(conf_2, 2),
                 'Size': size_2,
-                'ContainerSize': cs2 or None,
-                'SizeCode': iso_s2 or None,
+                'ContainerSize': cs2 or f"{size_2} FT",
+                'SizeCode': iso_s2 or ('22G1' if size_2 == '20' else '42G1'),
                 'Position': 'REAR',
                 'Images': c2_images
             })
@@ -1146,6 +1254,12 @@ class CloudOutboxDispatcher:
         event_record = self.repository.event(event_id)
         if not event_record:
             return {'success': False, 'status': 'NOT_FOUND', 'error': f'Event {event_id} not found'}
+        if not self.is_dispatchable_event(event_record, allow_synced=True):
+            return {
+                'success': False,
+                'status': 'REJECTED_UNREADABLE_OR_LOW_CONFIDENCE',
+                'error': f'Event {event_id} is unreadable or OCR confidence is below 50%'
+            }
 
         try:
             payload = self.build_event_payload(event_id)
@@ -1172,7 +1286,7 @@ class CloudOutboxDispatcher:
                 }
             else:
                 self._is_online = False
-                err_msg = self._last_error or f"Site returned status: {res}"
+                err_msg = getattr(self.session, '_auth_error', None) or self._last_error or f"Site returned status: {res}"
                 log.warning('prosper_manual_dispatch_rejected', extra={'event_id': event_id, 'status': str(res)})
                 return {
                     'success': False,
@@ -1222,7 +1336,7 @@ class CloudOutboxDispatcher:
                 # the same persistent identity guard here as enqueue().
                 if self.repository:
                     current = self.repository.event(event_id)
-                    if current and (current.get('cloud_synced') or current.get('status') != 'CONFIRMED' or not current.get('container_number')):
+                    if current and not self.is_dispatchable_event(current):
                         self.queue.task_done()
                         continue
                     canonical = self.repository.canonical_event_id(event_id)
@@ -1279,7 +1393,7 @@ class CloudOutboxDispatcher:
             else:
                 self._is_online = False
                 if success == 'OFFLINE':
-                    self._last_error = 'Cloud endpoint unreachable or offline'
+                    self._last_error = getattr(self.session, '_auth_error', None) or 'Cloud endpoint unreachable or offline'
                 elif success == 'REJECTED':
                     self._last_error = 'Cloud rejected payload (validation or authentication error)'
                 elif 'exc' in locals() and exc:
